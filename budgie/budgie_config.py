@@ -8,13 +8,15 @@ class BudgieConfig(PretrainedConfig):
     def __init__(
         self,
         vocab_size: int = 32768,
-        hidden_size: int = 2048,
-        intermediate_size: int = 2048*3,
-        num_hidden_layers: int = 32,
+        hidden_size: int = 4096,
+        intermediate_size: int = int(4096*2.5),
+        num_hidden_layers: int = 24,
         num_attention_heads: int = 32,
-        num_key_value_heads: int | None = 16,
+        num_key_value_heads: int | None = None,
         hidden_act: str = "silu",
-        max_position_embeddings: int = 8192,
+        max_position_embeddings: int = 1024 * 16,
+        # Alias for `max_position_embeddings` (often called "context length" in training code).
+        context_length: int | None = None,
         initializer_range: float = 0.02,
         rms_norm_eps: float = 1e-6, 
         use_cache: bool = False,
@@ -25,6 +27,12 @@ class BudgieConfig(PretrainedConfig):
         pretraining_tp: int = 1,
         rope_theta: float = 10000.0,
         rope_scaling: dict | None = None,
+        # Back-compat: allow passing a scalar scaling factor instead of a HF-style rope_scaling dict.
+        # For 8k -> 32k extension: set max_position_embeddings=32768 and rope_scaling_factor=4.0.
+        rope_scaling_factor: float | None = None,
+        rope_scaling_type: str = "linear",
+        # Optional hint for rope_scaling variants that want the original context length.
+        original_max_position_embeddings: int | None = None,
         attention_bias: bool = False,
         attention_dropout: float = 0.01,
         mlp_bias: bool = False,
@@ -37,7 +45,7 @@ class BudgieConfig(PretrainedConfig):
         local_attn_implementation: str = "gla_sliding",
         bridge_attn_implementation: str = "gla_landmark",
         bridge_every_n_layers: int = 6,
-        bridge_layer_offset: int = 5,
+        bridge_layer_offset: int = 4,
         tiny_conv_on_local_layers: bool = False,
         tiny_conv_on_bridge_layers: bool = True,
         tiny_conv_every_n_bridge_layers: int = 2,
@@ -49,12 +57,36 @@ class BudgieConfig(PretrainedConfig):
         use_liger_kernel: bool = True,
         use_causal_conv1d: bool = True,
         share_all_layers: bool = False,
-        num_phases: int = 2,
+        num_phases: int = 3,
         use_phase_layer_gates: bool = True,
         _attn_implementation: str = "sdpa",
         **kwargs,
     ):
         legacy_attention_window = kwargs.pop("attention_window", None)
+
+        if context_length is not None:
+            max_position_embeddings = int(context_length)
+        if not isinstance(max_position_embeddings, int) or max_position_embeddings <= 0:
+            raise ValueError(f"`max_position_embeddings` must be a positive int, got {max_position_embeddings!r}.")
+
+        if rope_scaling_factor is not None:
+            rope_scaling_factor = float(rope_scaling_factor)
+            if rope_scaling_factor <= 0:
+                raise ValueError(f"`rope_scaling_factor` must be > 0, got {rope_scaling_factor!r}.")
+            if rope_scaling is None and rope_scaling_factor != 1.0:
+                rope_scaling = {"type": str(rope_scaling_type), "factor": rope_scaling_factor}
+
+        if original_max_position_embeddings is not None:
+            original_max_position_embeddings = int(original_max_position_embeddings)
+            if original_max_position_embeddings <= 0:
+                raise ValueError(
+                    "`original_max_position_embeddings` must be a positive int, "
+                    f"got {original_max_position_embeddings!r}."
+                )
+            if rope_scaling is not None and "original_max_position_embeddings" not in rope_scaling:
+                rope_scaling = dict(rope_scaling)
+                rope_scaling["original_max_position_embeddings"] = original_max_position_embeddings
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -78,6 +110,7 @@ class BudgieConfig(PretrainedConfig):
 
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
+        self.original_max_position_embeddings = original_max_position_embeddings
 
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout

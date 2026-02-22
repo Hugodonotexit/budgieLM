@@ -77,6 +77,23 @@ class BudgieModel(BudgiePreTrainedModel):
 
         self._layer_is_bridge: list[bool] = [is_bridge(i) for i in range(config.num_hidden_layers)]
 
+        if self.use_phase_layer_gates:
+            if self.num_phases <= 0:
+                raise ValueError("`config.num_phases` must be a positive int.")
+            self.phase_embed = nn.Embedding(self.num_phases, config.hidden_size)
+            self.layer_embed = nn.Embedding(config.num_hidden_layers, config.hidden_size)
+            self.attn_gate_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
+            self.mlp_gate_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
+            nn.init.zeros_(self.attn_gate_proj.weight)
+            nn.init.zeros_(self.attn_gate_proj.bias)
+            nn.init.zeros_(self.mlp_gate_proj.weight)
+            nn.init.zeros_(self.mlp_gate_proj.bias)
+        else:
+            self.phase_embed = None
+            self.layer_embed = None
+            self.attn_gate_proj = None
+            self.mlp_gate_proj = None
+
         if not share_all_layers:
             if not use_hybrid_layers:
                 self._needs_4d_causal_mask = False
@@ -132,23 +149,6 @@ class BudgieModel(BudgiePreTrainedModel):
             self.shared_attn = BudgieGLASharedHybrid(config=config, layer_idx=0)
             self.shared_mlp = budgie_make_mlp(config)
 
-            if self.use_phase_layer_gates:
-                if self.num_phases <= 0:
-                    raise ValueError("`config.num_phases` must be a positive int.")
-                self.phase_embed = nn.Embedding(self.num_phases, config.hidden_size)
-                self.layer_embed = nn.Embedding(config.num_hidden_layers, config.hidden_size)
-                self.attn_gate_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
-                self.mlp_gate_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
-                nn.init.zeros_(self.attn_gate_proj.weight)
-                nn.init.zeros_(self.attn_gate_proj.bias)
-                nn.init.zeros_(self.mlp_gate_proj.weight)
-                nn.init.zeros_(self.mlp_gate_proj.bias)
-            else:
-                self.phase_embed = None
-                self.layer_embed = None
-                self.attn_gate_proj = None
-                self.mlp_gate_proj = None
-
             scaffolds: list[nn.Module] = []
             for layer_idx in range(config.num_hidden_layers):
                 bridge = self._layer_is_bridge[layer_idx]
@@ -180,9 +180,6 @@ class BudgieModel(BudgiePreTrainedModel):
     def _get_phase_layer_gates(
         self, *, phase_idx: int, layer_idx: int, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not bool(getattr(self.config, "share_all_layers", False)):
-            raise RuntimeError("Phase/layer gates are only supported when `share_all_layers=True`.")
-
         if not self.use_phase_layer_gates:
             ones = hidden_states.new_ones((1, 1, hidden_states.shape[-1]))
             return ones, ones
@@ -283,9 +280,11 @@ class BudgieModel(BudgiePreTrainedModel):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of `input_ids` or `inputs_embeds`.")
 
-        if bool(getattr(self.config, "share_all_layers", False)) and self.num_phases > 1:
+        if self.num_phases > 1:
             if use_cache or past_key_values is not None:
-                logger.warning_once("`num_phases > 1` disables KV-cache. Forcing `use_cache=False` and dropping `past_key_values`.")
+                logger.warning_once(
+                    "`num_phases > 1` disables KV-cache. Forcing `use_cache=False` and dropping `past_key_values`."
+                )
             use_cache = False
             past_key_values = None
 
@@ -383,50 +382,66 @@ class BudgieModel(BudgiePreTrainedModel):
                     if output_attentions:
                         all_self_attns += (layer_outputs[1],)
         else:
-            for decoder_layer in self.layers:
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
+            for phase_idx in range(self.num_phases):
+                for layer_idx, decoder_layer in enumerate(self.layers):
+                    if output_hidden_states:
+                        all_hidden_states += (hidden_states,)
 
-                if self.gradient_checkpointing and self.training:
+                    if self.gradient_checkpointing and self.training:
 
-                    def create_custom_forward(module):
-                        def custom_forward(*inputs):
-                            return module(*inputs, landmark_mask=landmark_mask, attention_mask_2d=attention_mask)
+                        def create_custom_forward(module, phase_idx, layer_idx):
+                            def custom_forward(*inputs):
+                                hs_in = inputs[0]
+                                attn_gate, mlp_gate = self._get_phase_layer_gates(
+                                    phase_idx=phase_idx, layer_idx=layer_idx, hidden_states=hs_in
+                                )
+                                return module(
+                                    *inputs,
+                                    attn_gate=attn_gate,
+                                    mlp_gate=mlp_gate,
+                                    landmark_mask=landmark_mask,
+                                    attention_mask_2d=attention_mask,
+                                )
 
-                        return custom_forward
+                            return custom_forward
 
-                    layer_outputs = self._gradient_checkpointing_func(
-                        create_custom_forward(decoder_layer),
-                        hidden_states,
-                        causal_mask,
-                        position_ids,
-                        past_key_values,
-                        output_attentions,
-                        use_cache,
-                        cache_position,
-                        position_embeddings,
-                    )
-                else:
-                    layer_outputs = decoder_layer(
-                        hidden_states,
-                        attention_mask=causal_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
-                        position_embeddings=position_embeddings,
-                        landmark_mask=landmark_mask,
-                        attention_mask_2d=attention_mask,
-                    )
+                        layer_outputs = self._gradient_checkpointing_func(
+                            create_custom_forward(decoder_layer, phase_idx, layer_idx),
+                            hidden_states,
+                            causal_mask,
+                            position_ids,
+                            past_key_values,
+                            output_attentions,
+                            use_cache,
+                            cache_position,
+                            position_embeddings,
+                        )
+                    else:
+                        attn_gate, mlp_gate = self._get_phase_layer_gates(
+                            phase_idx=phase_idx, layer_idx=layer_idx, hidden_states=hidden_states
+                        )
+                        layer_outputs = decoder_layer(
+                            hidden_states,
+                            attention_mask=causal_mask,
+                            position_ids=position_ids,
+                            past_key_value=past_key_values,
+                            output_attentions=output_attentions,
+                            use_cache=use_cache,
+                            cache_position=cache_position,
+                            position_embeddings=position_embeddings,
+                            attn_gate=attn_gate,
+                            mlp_gate=mlp_gate,
+                            landmark_mask=landmark_mask,
+                            attention_mask_2d=attention_mask,
+                        )
 
-                hidden_states = layer_outputs[0]
+                    hidden_states = layer_outputs[0]
 
-                if use_cache:
-                    next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                    if use_cache:
+                        next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
-                if output_attentions:
-                    all_self_attns += (layer_outputs[1],)
+                    if output_attentions:
+                        all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
 

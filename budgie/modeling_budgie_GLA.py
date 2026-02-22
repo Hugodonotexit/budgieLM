@@ -801,13 +801,16 @@ def _budgie_landmark_attention(
 
         block_size = int(landmark_every)
         max_full_landmarks = k_len // block_size
-        landmark_pos = torch.arange(
-            block_size - 1,
-            block_size * max_full_landmarks,
-            block_size,
-            device=device,
-            dtype=torch.long,
-        )
+        if max_full_landmarks <= 0:
+            landmark_pos = torch.empty((0,), device=device, dtype=torch.long)
+        else:
+            landmark_pos = torch.arange(
+                block_size - 1,
+                block_size * max_full_landmarks,
+                block_size,
+                device=device,
+                dtype=torch.long,
+            )
 
         for start in range(0, k_len, block_size):
             end = min(k_len, start + block_size)
@@ -1624,6 +1627,8 @@ class LlamaDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        attn_gate: Optional[torch.Tensor] = None,
+        mlp_gate: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -1677,13 +1682,17 @@ class LlamaDecoderLayer(nn.Module):
                 )
 
 
-        hidden_states = residual + hidden_states
+        if attn_gate is None:
+            attn_gate = 1
+        hidden_states = residual + (hidden_states * attn_gate)
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        if mlp_gate is None:
+            mlp_gate = 1
+        hidden_states = residual + (hidden_states * mlp_gate)
 
         outputs = (hidden_states,)
 

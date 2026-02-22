@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.python-version
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Virtual envs
+.venv/
+venv/
+
+# Experiment outputs / checkpoints
+checkpoints/
+outputs/
+logs/
+runs/
+wandb/
+*.log
+*.out
+
+# Model artifacts
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# Torch / compile caches
+torch_compile_cache/
+
+# Local scratch (accidental)
+1
+
