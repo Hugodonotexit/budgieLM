@@ -8,6 +8,7 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 
 from transformers.cache_utils import Cache, StaticCache
+from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.utils import is_torchdynamo_compiling, logging
 
@@ -19,7 +20,7 @@ from .modeling_budgie_GLA import _prepare_4d_causal_attention_mask_with_cache_po
 logger = logging.get_logger(__name__)
 
 
-class BudgieForCausalLM(BudgiePreTrainedModel):
+class BudgieForCausalLM(BudgiePreTrainedModel, GenerationMixin):
     config_class = BudgieConfig
     _tied_weights_keys = ["lm_head.weight"]
 

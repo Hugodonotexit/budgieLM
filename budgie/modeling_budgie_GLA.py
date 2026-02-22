@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+import importlib
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -55,17 +56,81 @@ _CONFIG_FOR_DOC = "LlamaConfig"
 _flash_attn_import_error = None
 try:
     from hopper.flash_attn_interface import flash_attn_func
-except Exception as _flash_attn_import_error:  # pragma: no cover
+except Exception as exc:  # pragma: no cover
+    _flash_attn_import_error = exc
     flash_attn_func = None
+
+_xformers_import_error = None
+_xformers_memory_efficient_attention = None
+_xformers_LowerTriangularMask = None
+_xformers_LocalAttentionFromBottomRightMask = None
+try:  # pragma: no cover
+    import xformers.ops as _xops
+
+    _xformers_memory_efficient_attention = getattr(_xops, "memory_efficient_attention", None)
+    try:
+        from xformers.ops.fmha.attn_bias import LowerTriangularMask as _xformers_LowerTriangularMask
+    except Exception:
+        _xformers_LowerTriangularMask = None
+    try:
+        from xformers.ops.fmha.attn_bias import (
+            LocalAttentionFromBottomRightMask as _xformers_LocalAttentionFromBottomRightMask,
+        )
+    except Exception:
+        _xformers_LocalAttentionFromBottomRightMask = None
+except Exception as exc:
+    _xformers_import_error = exc
+    _xops = None
+
+_causal_conv1d_import_error = None
+causal_conv1d_fn = None
+causal_conv1d_update = None
+try:  # pragma: no cover
+    from causal_conv1d import causal_conv1d_fn as causal_conv1d_fn
+    from causal_conv1d import causal_conv1d_update as causal_conv1d_update
+except Exception as exc:  # pragma: no cover
+    _causal_conv1d_import_error = exc
+    causal_conv1d_fn = None
+    causal_conv1d_update = None
+
+_liger_import_error = None
+_LIGER_RMSNORM_CLS = None
+_LIGER_SWIGLU_MLP_CLS = None
+for _liger_mod_name in (
+    "liger_kernel.transformers",
+    "liger_kernel.transformers.layers",
+    "liger_kernel.transformers.modeling",
+):
+    try:  # pragma: no cover
+        _liger_mod = importlib.import_module(_liger_mod_name)
+    except Exception as exc:
+        _liger_import_error = exc
+        continue
+
+    _LIGER_RMSNORM_CLS = getattr(_liger_mod, "LigerRMSNorm", None)
+    _LIGER_SWIGLU_MLP_CLS = getattr(_liger_mod, "LigerSwiGLUMLP", None)
+    if _LIGER_RMSNORM_CLS is not None or _LIGER_SWIGLU_MLP_CLS is not None:
+        break
+
+if _LIGER_RMSNORM_CLS is not None:  # pragma: no cover
+    ALL_LAYERNORM_LAYERS.append(_LIGER_RMSNORM_CLS)
 
 
 class BudgieCausalDepthwiseConv1d(nn.Module):
-    def __init__(self, hidden_size: int, kernel_size: int = 3, bias: bool = False, init_zero: bool = True):
+    def __init__(
+        self,
+        hidden_size: int,
+        kernel_size: int = 3,
+        bias: bool = False,
+        init_zero: bool = True,
+        use_causal_conv1d: bool = True,
+    ):
         super().__init__()
         if kernel_size <= 0 or not isinstance(kernel_size, int):
             raise ValueError(f"`kernel_size` must be a positive int, got {kernel_size!r}.")
         self.kernel_size = kernel_size
         self.hidden_size = hidden_size
+        self.use_causal_conv1d = bool(use_causal_conv1d)
         self.conv = nn.Conv1d(
             in_channels=hidden_size,
             out_channels=hidden_size,
@@ -98,6 +163,27 @@ class BudgieCausalDepthwiseConv1d(nn.Module):
         bsz, q_len, _ = hidden_states.shape
         k = self.kernel_size
 
+        def _conv_causal_padded(sequence_bsh: torch.Tensor, *, take_last: int) -> torch.Tensor:
+            x = sequence_bsh.transpose(1, 2)  # (B, H, L)
+            if k > 1:
+                x = F.pad(x, (k - 1, 0))
+            y = self.conv(x).transpose(1, 2)  # (B, L, H)
+            return y[:, -take_last:, :]
+
+        def _conv_no_pad(context_bsh: torch.Tensor, *, take_last: int) -> torch.Tensor:
+            x = context_bsh.transpose(1, 2)  # (B, H, L)
+            y = self.conv(x).transpose(1, 2)  # (B, L-k+1, H)
+            return y[:, -take_last:, :]
+
+        def _causal_conv1d_full(context_bsh: torch.Tensor, *, take_last: int) -> torch.Tensor:
+            x = context_bsh.transpose(1, 2).contiguous()  # (B, H, L)
+            weight = self.conv.weight.squeeze(1).contiguous()  # (H, K)
+            bias = self.conv.bias
+            if causal_conv1d_fn is None:
+                return _conv_causal_padded(context_bsh, take_last=take_last)
+            y = causal_conv1d_fn(x, weight, bias, None)  # (B, H, L)
+            return y.transpose(1, 2)[:, -take_last:, :].contiguous()  # (B, take_last, H)
+
         if use_cache and past_key_value is not None and k > 1:
             if layer_idx is None:
                 raise ValueError("`layer_idx` is required when `use_cache=True` for tiny conv state caching.")
@@ -109,21 +195,51 @@ class BudgieCausalDepthwiseConv1d(nn.Module):
 
             prev = conv_state.get(layer_idx)
             if prev is None:
-                prev = hidden_states.new_zeros((bsz, k - 1, self.hidden_size))
+                prev = hidden_states.new_zeros((bsz, self.hidden_size, k - 1))
 
-            context = torch.cat([prev, hidden_states], dim=1)  # (B, k-1+S, H)
-            x = context.transpose(1, 2)  # (B, H, k-1+S)
-            y = self.conv(x).transpose(1, 2)  # (B, S, H)
+            if prev.shape != (bsz, self.hidden_size, k - 1):
+                raise ValueError(
+                    f"Unexpected conv cache state shape for layer {layer_idx}: expected {(bsz, self.hidden_size, k - 1)}, got {tuple(prev.shape)}."
+                )
 
-            new_prev = context[:, - (k - 1) :, :]
+            if (
+                self.use_causal_conv1d
+                and causal_conv1d_update is not None
+                and hidden_states.shape[1] == 1
+            ):
+                x_t = hidden_states[:, 0, :].contiguous()  # (B, H)
+                weight = self.conv.weight.squeeze(1).contiguous()  # (H, K)
+                bias = self.conv.bias
+                out = causal_conv1d_update(x_t, prev, weight, bias, None)
+                if isinstance(out, tuple):
+                    y_t, new_prev = out[0], out[1]
+                else:
+                    y_t, new_prev = out, prev
+                y = y_t[:, None, :]
+
+                if new_prev.shape != (bsz, self.hidden_size, k - 1):
+                    raise ValueError(
+                        f"`causal_conv1d_update` returned/updated an unexpected state shape {tuple(new_prev.shape)}; expected {(bsz, self.hidden_size, k - 1)}."
+                    )
+            else:
+                prev_bsh = prev.transpose(1, 2)  # (B, k-1, H)
+                context = torch.cat([prev_bsh, hidden_states], dim=1)  # (B, k-1+S, H)
+                if self.use_causal_conv1d and causal_conv1d_fn is not None:
+                    y = _causal_conv1d_full(context, take_last=q_len)
+                else:
+                    y = _conv_no_pad(context, take_last=q_len)
+
+                context_tail = context[:, -(k - 1) :, :]  # (B, k-1, H)
+                new_prev = context_tail.transpose(1, 2).contiguous()  # (B, H, k-1)
             if not self.training:
                 new_prev = new_prev.detach()
             conv_state[layer_idx] = new_prev
         else:
-            x = hidden_states.transpose(1, 2)  # (B, H, S)
-            if k > 1:
-                x = F.pad(x, (k - 1, 0))
-            y = self.conv(x).transpose(1, 2)  # (B, S, H)
+            if self.use_causal_conv1d and causal_conv1d_fn is not None and k > 1:
+                y = _causal_conv1d_full(hidden_states, take_last=q_len)
+            else:
+                # Includes k==1 (pointwise) or missing kernel.
+                y = _conv_causal_padded(hidden_states, take_last=q_len)
 
         if attention_mask_2d is not None and attention_mask_2d.dim() == 2:
             y = y * attention_mask_2d[:, :, None].to(dtype=y.dtype)
@@ -368,6 +484,469 @@ class LlamaMLP(nn.Module):
         return down_proj
 
 
+def budgie_make_rmsnorm(config, hidden_size: int, eps: float):
+    if bool(getattr(config, "use_liger_kernel", False)) and _LIGER_RMSNORM_CLS is not None:
+        try:  # pragma: no cover
+            return _LIGER_RMSNORM_CLS(hidden_size, eps=eps)
+        except TypeError:
+            try:
+                return _LIGER_RMSNORM_CLS(hidden_size, eps)
+            except Exception as exc:
+                logger.warning_once(f"Failed to create Liger RMSNorm; falling back to LlamaRMSNorm. Error: {exc}")
+        except Exception as exc:
+            logger.warning_once(f"Failed to create Liger RMSNorm; falling back to LlamaRMSNorm. Error: {exc}")
+    return LlamaRMSNorm(hidden_size, eps=eps)
+
+
+def budgie_make_mlp(config):
+    if bool(getattr(config, "use_liger_kernel", False)) and _LIGER_SWIGLU_MLP_CLS is not None:
+        if int(getattr(config, "pretraining_tp", 1)) != 1:
+            logger.warning_once("Liger MLP backend is disabled when `config.pretraining_tp > 1`; using LlamaMLP.")
+        else:
+            try:  # pragma: no cover
+                return _LIGER_SWIGLU_MLP_CLS(config)
+            except TypeError:
+                try:
+                    return _LIGER_SWIGLU_MLP_CLS(
+                        hidden_size=int(config.hidden_size),
+                        intermediate_size=int(config.intermediate_size),
+                        bias=bool(getattr(config, "mlp_bias", False)),
+                    )
+                except TypeError:
+                    try:
+                        return _LIGER_SWIGLU_MLP_CLS(
+                            int(config.hidden_size),
+                            int(config.intermediate_size),
+                            bool(getattr(config, "mlp_bias", False)),
+                        )
+                    except Exception as exc:
+                        logger.warning_once(f"Failed to create Liger MLP; falling back to LlamaMLP. Error: {exc}")
+                except Exception as exc:
+                    logger.warning_once(f"Failed to create Liger MLP; falling back to LlamaMLP. Error: {exc}")
+            except Exception as exc:
+                logger.warning_once(f"Failed to create Liger MLP; falling back to LlamaMLP. Error: {exc}")
+    return LlamaMLP(config)
+
+
+def _budgie_xformers_attention(
+    *,
+    query_states: torch.Tensor,  # (B, S_q, H, D)
+    key_states: torch.Tensor,  # (B, S_k, H, D)
+    value_states: torch.Tensor,  # (B, S_k, H, D)
+    attention_mask_2d: Optional[torch.Tensor],  # (B, S_k) with 1=keep,0=pad
+    dropout_p: float,
+    is_causal: bool,
+    sliding_window: Optional[int] = None,
+    allow_xformers_op: bool = True,
+) -> torch.Tensor:
+    q = query_states.contiguous()
+    k = key_states.contiguous()
+    v = value_states.contiguous()
+
+    bsz, q_len, nheads, _ = q.shape
+    k_len = k.shape[1]
+    qk_dim = q.shape[-1]
+
+    if sliding_window is not None and isinstance(sliding_window, int) and sliding_window >= k_len:
+        # If the window covers all available keys, local attention is identical to dense causal attention.
+        sliding_window = None
+
+    # Many xFormers CUDA kernels have strict requirements (dtype, head dim multiple-of-8, etc.).
+    # If we can confidently predict that dispatch will fail, skip straight to the eager fallback
+    # to avoid emitting a huge NotImplementedError message.
+    try_xformers_op = bool(allow_xformers_op and _xformers_memory_efficient_attention is not None)
+    if q.is_cuda:
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            try_xformers_op = False
+        if qk_dim < 32 or (qk_dim % 8) != 0:
+            try_xformers_op = False
+        if sliding_window is not None:
+            try:
+                major, minor = torch.cuda.get_device_capability(q.device)
+                if (major, minor) < (8, 0):
+                    try_xformers_op = False
+            except Exception:
+                # If we can't query capability, keep trying.
+                pass
+
+    attn_bias = None
+    if is_causal and sliding_window is None and _xformers_LowerTriangularMask is not None:
+        attn_bias = _xformers_LowerTriangularMask()
+    elif is_causal and sliding_window is not None and _xformers_LocalAttentionFromBottomRightMask is not None:
+        # xFormers has changed this API across versions.
+        try:
+            attn_bias = _xformers_LocalAttentionFromBottomRightMask(window_left=sliding_window, window_right=0)
+        except TypeError:
+            try:
+                attn_bias = _xformers_LocalAttentionFromBottomRightMask(sliding_window, 0)
+            except TypeError:
+                try:
+                    attn_bias = _xformers_LocalAttentionFromBottomRightMask(window_size=sliding_window)
+                except TypeError:
+                    attn_bias = _xformers_LocalAttentionFromBottomRightMask(sliding_window)
+
+    # If there is padding, we must materialize a tensor bias so that masking is correctly applied.
+    if attn_bias is not None and attention_mask_2d is not None:
+        try:
+            if attention_mask_2d.dim() == 2 and attention_mask_2d.shape == (bsz, k_len):
+                if attention_mask_2d.to(dtype=torch.bool).all().item() is False:
+                    attn_bias = None
+        except Exception:
+            # If anything goes wrong (e.g. tracing), be conservative and materialize.
+            attn_bias = None
+
+    if attn_bias is None:
+        min_val = torch.finfo(torch.float32).min
+        bias = q.new_zeros((q_len, k_len), dtype=torch.float32)
+
+        i = torch.arange(q_len, device=q.device)[:, None]
+        j = torch.arange(k_len, device=q.device)[None, :]
+        offset = k_len - q_len
+
+        allowed = j <= (i + offset) if is_causal else torch.ones_like(bias, dtype=torch.bool)
+        if sliding_window is not None:
+            if not isinstance(sliding_window, int) or sliding_window <= 0:
+                raise ValueError("xFormers sliding-window attention requires `sliding_window` to be a positive int.")
+            allowed = allowed & (j >= (i + offset - (sliding_window - 1)))
+
+        bias = bias.masked_fill(~allowed, min_val)
+        attn_bias = bias[None, None, :, :]  # (1, 1, S_q, S_k)
+
+        if attention_mask_2d is not None:
+            if attention_mask_2d.dim() != 2:
+                raise ValueError("`attention_mask_2d` must be a 2D padding mask (B, S_k) when using xFormers.")
+            key_keep = attention_mask_2d.to(dtype=torch.bool)
+            if key_keep.shape[0] != bsz or key_keep.shape[1] != k_len:
+                raise ValueError(
+                    f"`attention_mask_2d` must have shape {(bsz, k_len)}, got {tuple(key_keep.shape)}."
+                )
+            if not torch.all(key_keep):
+                attn_bias = attn_bias.expand(bsz, 1, q_len, k_len).clone()
+                attn_bias = attn_bias.masked_fill(~key_keep[:, None, None, :], min_val)
+
+    if try_xformers_op:
+        try:
+            out = _xformers_memory_efficient_attention(q, k, v, attn_bias=attn_bias, p=dropout_p)
+            return out
+        except NotImplementedError as exc:
+            logger.warning_once(
+                "xFormers `memory_efficient_attention` has no supported CUDA operator for these inputs; falling back to eager attention."
+            )
+            logger.debug(str(exc))
+        except RuntimeError as exc:
+            logger.warning_once(
+                "xFormers `memory_efficient_attention` failed at runtime; falling back to eager attention."
+            )
+            logger.debug(str(exc))
+
+    # Eager fallback (supports any dtype/device, but can be slow).
+    q_t = q.transpose(1, 2)  # (B, H, S_q, D)
+    k_t = k.transpose(1, 2)  # (B, H, S_k, D)
+    v_t = v.transpose(1, 2)  # (B, H, S_k, D)
+
+    dim = q_t.shape[-1]
+    scale = dim**-0.5
+    # Use a mask value representable in the *actual compute dtype* that autocast may select.
+    # Using float32's minimum with fp16 tensors can overflow during `masked_fill`.
+    min_val = torch.finfo(q.dtype).min if q.is_floating_point() else torch.finfo(torch.float32).min
+
+    if sliding_window is not None:
+        if not isinstance(sliding_window, int) or sliding_window <= 0:
+            raise ValueError("Eager sliding-window attention requires `sliding_window` to be a positive int.")
+
+        # Chunked sliding-window attention without materializing (c, w, d) windows.
+        w = int(sliding_window)
+        offset = k_len - q_len
+        chunk_q = 128
+
+        key_keep_full = None
+        if attention_mask_2d is not None:
+            if attention_mask_2d.dim() != 2:
+                raise ValueError("`attention_mask_2d` must be a 2D padding mask (B, S_k) for eager attention.")
+            key_keep_full = attention_mask_2d.to(dtype=torch.bool)
+            if key_keep_full.shape != (bsz, k_len):
+                raise ValueError(
+                    f"`attention_mask_2d` must have shape {(bsz, k_len)}, got {tuple(key_keep_full.shape)}."
+                )
+
+        out_t = q_t.new_empty(q_t.shape)  # (B, H, S_q, D)
+
+        for qs in range(0, q_len, chunk_q):
+            qe = min(q_len, qs + chunk_q)
+            q_chunk = q_t[:, :, qs:qe, :]  # (B, H, c, D)
+            c = qe - qs
+
+            key_start = max(0, offset + qs - (w - 1))
+            key_end = offset + qe  # <= k_len when q_len<=k_len
+            k_range = k_t[:, :, key_start:key_end, :]  # (B, H, K, D)
+            v_range = v_t[:, :, key_start:key_end, :]  # (B, H, K, D)
+
+            q_pos = torch.arange(qs, qe, device=q.device)  # (c,)
+            q_abs = (offset + q_pos).to(dtype=torch.long)  # absolute key positions per query
+            k_abs = torch.arange(key_start, key_end, device=q.device, dtype=torch.long)  # (K,)
+
+            if is_causal:
+                allowed = (k_abs[None, :] <= q_abs[:, None]) & (k_abs[None, :] >= (q_abs[:, None] - (w - 1)))
+            else:
+                allowed = k_abs[None, :] >= (q_abs[:, None] - (w - 1))
+
+            attn_scores = torch.matmul(q_chunk, k_range.transpose(-2, -1)) * scale
+            attn_scores = attn_scores.masked_fill(~allowed[None, None, :, :], min_val)
+
+            if key_keep_full is not None:
+                keep_range = key_keep_full[:, key_start:key_end]  # (B, K)
+                attn_scores = attn_scores.masked_fill(~keep_range[:, None, None, :], min_val)
+
+            attn_probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+            if dropout_p and dropout_p > 0:
+                attn_probs = nn.functional.dropout(attn_probs, p=dropout_p, training=True)
+
+            out_chunk = torch.matmul(attn_probs, v_range.to(attn_probs.dtype)).to(q.dtype)  # (B, H, c, D)
+            if out_chunk.shape[-2] != c:
+                raise RuntimeError("Unexpected attention output shape in sliding-window eager path.")
+            out_t[:, :, qs:qe, :] = out_chunk
+
+        return out_t.transpose(1, 2).contiguous()
+
+    # Dense eager causal attention (O(S^2) memory/time).
+    attn_scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * scale  # (B,H,Q,K)
+    offset = k_len - q_len
+    i = torch.arange(q_len, device=q.device)[:, None]
+    j = torch.arange(k_len, device=q.device)[None, :]
+    allowed = j <= (i + offset) if is_causal else torch.ones((q_len, k_len), device=q.device, dtype=torch.bool)
+    attn_scores = attn_scores.masked_fill(~allowed[None, None, :, :], min_val)
+
+    if attention_mask_2d is not None:
+        if attention_mask_2d.dim() != 2:
+            raise ValueError("`attention_mask_2d` must be a 2D padding mask (B, S_k) for eager attention.")
+        key_keep = attention_mask_2d.to(dtype=torch.bool)
+        if key_keep.shape != (bsz, k_len):
+            raise ValueError(f"`attention_mask_2d` must have shape {(bsz, k_len)}, got {tuple(key_keep.shape)}.")
+        attn_scores = attn_scores.masked_fill(~key_keep[:, None, None, :], min_val)
+
+    attn_probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+    if dropout_p and dropout_p > 0:
+        attn_probs = nn.functional.dropout(attn_probs, p=dropout_p, training=True)
+
+    out = torch.matmul(attn_probs, v_t.to(attn_probs.dtype)).to(q.dtype)  # (B,H,Q,D)
+    return out.transpose(1, 2).contiguous()
+
+
+def _budgie_landmark_attention(
+    *,
+    query_states: torch.Tensor,  # (B, S, H, D)
+    key_states: torch.Tensor,  # (B, S, H, D)
+    value_states: torch.Tensor,  # (B, S, H, D)
+    attention_mask_2d: Optional[torch.Tensor],  # (B, S) with 1=keep,0=pad
+    landmark_mask: Optional[torch.Tensor],  # (B, S) bool
+    landmark_every: Optional[int],  # positional landmarks
+    dropout_p: float,
+    is_causal: bool,
+) -> torch.Tensor:
+    """
+    Memory-efficient eager landmark attention.
+
+    Pattern (causal "block-local + landmarks"):
+    - Each token attends to all tokens in its current block (delimited by landmark tokens), causally.
+    - Each token attends to all *previous* landmark tokens (global), causally.
+
+    This avoids materializing an (S,S) matrix by processing one block at a time.
+    """
+
+    if not is_causal:
+        raise NotImplementedError("Budgie landmark attention currently only supports causal self-attention.")
+
+    q = query_states.contiguous()
+    k = key_states.contiguous()
+    v = value_states.contiguous()
+
+    bsz, q_len, nheads, dim = q.shape
+    k_len = k.shape[1]
+    if q_len != k_len:
+        raise ValueError(
+            "Budgie landmark attention currently requires q_len == k_len (no KV-cache). "
+            f"Got q_len={q_len}, k_len={k_len}."
+        )
+
+    key_keep = None
+    if attention_mask_2d is not None:
+        if attention_mask_2d.dim() != 2:
+            raise ValueError("`attention_mask_2d` must be a 2D padding mask (B, S).")
+        key_keep = attention_mask_2d.to(dtype=torch.bool)
+        if key_keep.shape != (bsz, k_len):
+            raise ValueError(f"`attention_mask_2d` must have shape {(bsz, k_len)}, got {tuple(key_keep.shape)}.")
+
+    if landmark_mask is not None:
+        if landmark_mask.shape != (bsz, k_len):
+            raise ValueError(f"`landmark_mask` must have shape {(bsz, k_len)}, got {tuple(landmark_mask.shape)}.")
+
+    q_t = q.transpose(1, 2)  # (B, H, S, D)
+    k_t = k.transpose(1, 2)
+    v_t = v.transpose(1, 2)
+
+    scale = dim**-0.5
+    # Use a mask value representable in the actual compute dtype. Under autocast, matmuls may run in fp16/bf16 even
+    # if inputs are cast to fp32, so using float32's minimum can overflow during `masked_fill`.
+    min_val = torch.finfo(q.dtype).min if q.is_floating_point() else torch.finfo(torch.float32).min
+    out_t = q_t.new_empty((bsz, nheads, q_len, dim))  # (B, H, S, D)
+
+    device = q.device
+
+    # Fast path: positional landmarks (uniform blocks across the batch).
+    if landmark_mask is None:
+        if not isinstance(landmark_every, int) or landmark_every <= 0:
+            raise ValueError(
+                "Landmark mode requires either a provided `landmark_mask` or `landmark_every` as a positive int."
+            )
+
+        block_size = int(landmark_every)
+        max_full_landmarks = k_len // block_size
+        landmark_pos = torch.arange(
+            block_size - 1,
+            block_size * max_full_landmarks,
+            block_size,
+            device=device,
+            dtype=torch.long,
+        )
+
+        for start in range(0, k_len, block_size):
+            end = min(k_len, start + block_size)
+            q_block = q_t[:, :, start:end, :]  # (B, H, Lq, D)
+            k_local = k_t[:, :, start:end, :]
+            v_local = v_t[:, :, start:end, :]
+            lq = end - start
+
+            scores_local = torch.matmul(q_block, k_local.transpose(-2, -1)) * scale  # (B, H, Lq, Lq)
+            causal = torch.tril(torch.ones((lq, lq), device=device, dtype=torch.bool))
+            scores_local = scores_local.masked_fill(~causal[None, None, :, :], min_val)
+
+            if key_keep is not None:
+                keep_local = key_keep[:, start:end]
+                # Avoid `.item()` syncs on CUDA; masking with an all-True keep mask is a cheap no-op.
+                scores_local = scores_local.masked_fill(~keep_local[:, None, None, :], min_val)
+
+            prev_landmarks = start // block_size
+            if prev_landmarks > 0:
+                lm_idx = landmark_pos[:prev_landmarks]
+                k_lm = k_t[:, :, lm_idx, :]  # (B, H, P, D)
+                v_lm = v_t[:, :, lm_idx, :]
+                scores_lm = torch.matmul(q_block, k_lm.transpose(-2, -1)) * scale  # (B, H, Lq, P)
+
+                if key_keep is not None:
+                    keep_lm = key_keep[:, lm_idx]
+                    scores_lm = scores_lm.masked_fill(~keep_lm[:, None, None, :], min_val)
+
+                scores = torch.cat([scores_local, scores_lm], dim=-1)
+                probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(dtype=q.dtype)
+                if dropout_p and dropout_p > 0:
+                    probs = nn.functional.dropout(probs, p=dropout_p, training=True)
+
+                probs_local = probs[..., :lq]
+                probs_lm = probs[..., lq:]
+                out_block = torch.matmul(probs_local, v_local.to(dtype=probs.dtype)).to(dtype=q.dtype)
+                out_block = out_block + torch.matmul(probs_lm, v_lm.to(dtype=probs.dtype)).to(dtype=q.dtype)
+            else:
+                probs = torch.softmax(scores_local, dim=-1, dtype=torch.float32).to(dtype=q.dtype)
+                if dropout_p and dropout_p > 0:
+                    probs = nn.functional.dropout(probs, p=dropout_p, training=True)
+                out_block = torch.matmul(probs, v_local.to(dtype=probs.dtype)).to(dtype=q.dtype)
+
+            if key_keep is not None:
+                query_keep = key_keep[:, start:end]
+                out_block = out_block * query_keep[:, None, :, None].to(dtype=out_block.dtype)
+
+            out_t[:, :, start:end, :] = out_block
+
+        return out_t.transpose(1, 2).contiguous()
+
+    # Token-id landmarks: per-sample block boundaries.
+    for b in range(bsz):
+        is_landmark = landmark_mask[b].to(dtype=torch.bool, device=device)  # (S,)
+        landmark_pos = torch.nonzero(is_landmark, as_tuple=False).flatten()  # (N,)
+
+        # Blocks end right after each landmark token (so the landmark is included in the preceding block).
+        block_ends = (landmark_pos + 1).tolist()
+        if not block_ends or block_ends[-1] != k_len:
+            block_ends.append(k_len)
+        block_starts = [0] + block_ends[:-1]
+
+        prev_landmarks = 0
+        for start, end in zip(block_starts, block_ends):
+            if start >= end:
+                continue
+
+            q_block = q_t[b, :, start:end, :]  # (H, Lq, D)
+            k_local = k_t[b, :, start:end, :]  # (H, Lk, D)
+            v_local = v_t[b, :, start:end, :]
+            lq = end - start
+
+            query_keep = None
+            if key_keep is not None:
+                query_keep = key_keep[b, start:end]
+                if not bool(torch.any(query_keep).item()):
+                    out_t[b, :, start:end, :] = 0
+                    if bool(is_landmark[end - 1].item()):
+                        prev_landmarks += 1
+                    continue
+
+                valid_q = torch.nonzero(query_keep, as_tuple=False).flatten()
+                q_block = q_block.index_select(-2, valid_q)
+            else:
+                valid_q = None
+
+            scores_local = torch.matmul(q_block, k_local.transpose(-2, -1)) * scale
+
+            if valid_q is None:
+                causal = torch.tril(torch.ones((lq, lq), device=device, dtype=torch.bool))
+                scores_local = scores_local.masked_fill(~causal[None, :, :], min_val)
+            else:
+                j = torch.arange(lq, device=device, dtype=torch.long)[None, :]  # (1, Lk)
+                allowed = j <= valid_q[:, None]  # (Lq_valid, Lk)
+                scores_local = scores_local.masked_fill(~allowed[None, :, :], min_val)
+
+            if key_keep is not None:
+                keep_local = key_keep[b, start:end]
+                if not bool(torch.all(keep_local).item()):
+                    scores_local = scores_local.masked_fill(~keep_local[None, None, :], min_val)
+
+            if prev_landmarks > 0:
+                lm_idx = landmark_pos[:prev_landmarks]
+                k_lm = k_t[b, :, lm_idx, :]
+                v_lm = v_t[b, :, lm_idx, :]
+                scores_lm = torch.matmul(q_block, k_lm.transpose(-2, -1)) * scale
+                if key_keep is not None:
+                    keep_lm = key_keep[b, lm_idx]
+                    if not bool(torch.all(keep_lm).item()):
+                        scores_lm = scores_lm.masked_fill(~keep_lm[None, None, :], min_val)
+
+                scores = torch.cat([scores_local, scores_lm], dim=-1)
+                probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(dtype=q.dtype)
+                if dropout_p and dropout_p > 0:
+                    probs = nn.functional.dropout(probs, p=dropout_p, training=True)
+
+                probs_local = probs[..., :lq]
+                probs_lm = probs[..., lq:]
+                out_block = torch.matmul(probs_local, v_local.to(dtype=probs.dtype)).to(dtype=q.dtype)
+                out_block = out_block + torch.matmul(probs_lm, v_lm.to(dtype=probs.dtype)).to(dtype=q.dtype)
+            else:
+                probs = torch.softmax(scores_local, dim=-1, dtype=torch.float32).to(dtype=q.dtype)
+                if dropout_p and dropout_p > 0:
+                    probs = nn.functional.dropout(probs, p=dropout_p, training=True)
+                out_block = torch.matmul(probs, v_local.to(dtype=probs.dtype)).to(dtype=q.dtype)
+
+            if valid_q is None:
+                out_t[b, :, start:end, :] = out_block
+            else:
+                out_full = out_t[b, :, start:end, :]
+                out_full.zero_()
+                out_full.index_copy_(-2, valid_q, out_block)
+
+            if bool(is_landmark[end - 1].item()):
+                prev_landmarks += 1
+
+    return out_t.transpose(1, 2).contiguous()
+
+
 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -460,7 +1039,8 @@ class LlamaAttention(nn.Module):
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            effective_layer_idx = kwargs.get("layer_idx", self.layer_idx)
+            key_states, value_states = past_key_value.update(key_states, value_states, effective_layer_idx, cache_kwargs)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -499,7 +1079,7 @@ class LlamaAttention(nn.Module):
 
 
 
-class LlamaFlashGLA(LlamaAttention):
+class LlamaGLA(LlamaAttention):
     
 
     def __init__(self, *args, **kwargs):
@@ -509,11 +1089,11 @@ class LlamaFlashGLA(LlamaAttention):
         self.kv_proj_dim = 4 * self.head_dim   #2 latent heads each 2*d 
         self.q_proj_dim = 8 * self.head_dim
 
-        self.q_norm = LlamaRMSNorm(self.q_proj_dim, self.config.rms_norm_eps)
+        self.q_norm = budgie_make_rmsnorm(self.config, self.q_proj_dim, self.config.rms_norm_eps)
 
 
-        self.kv_norm_1 = LlamaRMSNorm(self.kv_proj_dim // 2, self.config.rms_norm_eps)
-        self.kv_norm_2 = LlamaRMSNorm(self.kv_proj_dim // 2, self.config.rms_norm_eps)
+        self.kv_norm_1 = budgie_make_rmsnorm(self.config, self.kv_proj_dim // 2, self.config.rms_norm_eps)
+        self.kv_norm_2 = budgie_make_rmsnorm(self.config, self.kv_proj_dim // 2, self.config.rms_norm_eps)
 
 
         #Query
@@ -537,16 +1117,43 @@ class LlamaFlashGLA(LlamaAttention):
         value_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         landmark_mask: Optional[torch.Tensor] = None,
+        attention_mask_2d: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if flash_attn_func is None:
-            raise ImportError(
-                "Budgie/GLA attention requires `hopper.flash_attn_interface.flash_attn_func`, but it could not be "
-                "imported. Install/enable the Hopper FlashAttention interface, or switch the config to "
-                "`config._attn_implementation = \"eager\"` to use the non-GLA attention path."
-            ) from _flash_attn_import_error
+        dropout_p = float(self.attention_dropout) if self.training else 0.0
 
-        attn_output, _ = flash_attn_func(q=query_states, k=key_states, v=value_states, causal=self.is_causal)
-        return attn_output
+        q = query_states.transpose(1, 2)  # (B, H, S_q, D)
+        k = key_states.transpose(1, 2)
+        v = value_states.transpose(1, 2)
+
+        attn_mask = attention_mask
+        is_causal = bool(self.is_causal)
+        if attn_mask is not None:
+            is_causal = False
+            # Common HF shape: (B, 1, S_q, S_k). SDPA typically expects (B, S_q, S_k) or broadcastable.
+            if attn_mask.dim() == 4 and attn_mask.shape[1] == 1:
+                attn_mask = attn_mask[:, 0, :, :]
+
+        if hasattr(nn.functional, "scaled_dot_product_attention"):
+            try:
+                out = nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
+                )
+                return out.transpose(1, 2).contiguous()
+            except (RuntimeError, TypeError):
+                pass
+
+        # Fallback: use xFormers if enabled/available, otherwise eager matmul/softmax.
+        out = _budgie_xformers_attention(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            attention_mask_2d=attention_mask_2d,
+            dropout_p=dropout_p,
+            is_causal=bool(self.is_causal),
+            sliding_window=None,
+            allow_xformers_op=bool(getattr(self.config, "use_xformers", False)),
+        )
+        return out
 
     def forward(
         self,
@@ -589,7 +1196,10 @@ class LlamaFlashGLA(LlamaAttention):
         # Cache
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            compressed_kv, key_rope = past_key_value.update(compressed_kv.unsqueeze(2), key_rope, self.layer_idx, cache_kwargs)
+            effective_layer_idx = kwargs.get("layer_idx", self.layer_idx)
+            compressed_kv, key_rope = past_key_value.update(
+                compressed_kv.unsqueeze(2), key_rope, effective_layer_idx, cache_kwargs
+            )
 
 
         key_states = torch.zeros_like(query_states)  
@@ -635,6 +1245,7 @@ class LlamaFlashGLA(LlamaAttention):
             value_states=value_states,
             attention_mask=attention_mask,
             landmark_mask=kwargs.get("landmark_mask"),
+            attention_mask_2d=kwargs.get("attention_mask_2d"),
         )
 
 
@@ -645,7 +1256,7 @@ class LlamaFlashGLA(LlamaAttention):
         return attn_output, None, past_key_value
 
 
-class BudgieFlashGLASlidingWindowAttention(LlamaFlashGLA):
+class BudgieGLASlidingWindowAttention(LlamaGLA):
     """
     GLA attention with a causal sliding window.
 
@@ -660,7 +1271,7 @@ class BudgieFlashGLASlidingWindowAttention(LlamaFlashGLA):
 
         if not isinstance(self.sliding_window, int) or self.sliding_window <= 0:
             raise ValueError(
-                "BudgieFlashGLASlidingWindowAttention requires `config.sliding_window` to be a positive int."
+                "BudgieGLASlidingWindowAttention requires `config.sliding_window` to be a positive int."
             )
 
     def _flash_attn(
@@ -670,13 +1281,20 @@ class BudgieFlashGLASlidingWindowAttention(LlamaFlashGLA):
         value_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         landmark_mask: Optional[torch.Tensor] = None,
+        attention_mask_2d: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if flash_attn_func is None:
-            raise ImportError(
-                "Budgie/GLA attention requires `hopper.flash_attn_interface.flash_attn_func`, but it could not be "
-                "imported. Install/enable the Hopper FlashAttention interface, or switch the config to "
-                "`config._attn_implementation = \"eager\"` to use the non-GLA attention path."
-            ) from _flash_attn_import_error
+            dropout_p = float(self.attention_dropout) if self.training else 0.0
+            return _budgie_xformers_attention(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                attention_mask_2d=attention_mask_2d,
+                dropout_p=dropout_p,
+                is_causal=bool(self.is_causal),
+                sliding_window=int(self.sliding_window),
+                allow_xformers_op=bool(getattr(self.config, "use_xformers", False)),
+            )
 
         try:
             attn_output, _ = flash_attn_func(
@@ -714,7 +1332,7 @@ class BudgieFlashGLASlidingWindowAttention(LlamaFlashGLA):
         return attn_output
 
 
-class BudgieFlashGLALandmarkAttention(LlamaFlashGLA):
+class BudgieGLALandmarkAttention(LlamaGLA):
     """
     Landmark attention implemented on top of GLA projections.
 
@@ -733,7 +1351,7 @@ class BudgieFlashGLALandmarkAttention(LlamaFlashGLA):
         self.landmark_every = getattr(self.config, "landmark_every", None)
         if self.landmark_every is None and getattr(self.config, "landmark_token_id", None) is None:
             raise ValueError(
-                "BudgieFlashGLALandmarkAttention requires either `config.landmark_every` (positional landmarks) or "
+                "BudgieGLALandmarkAttention requires either `config.landmark_every` (positional landmarks) or "
                 "`config.landmark_token_id` (token-id landmarks)."
             )
         if self.landmark_every is not None and (not isinstance(self.landmark_every, int) or self.landmark_every <= 0):
@@ -746,58 +1364,216 @@ class BudgieFlashGLALandmarkAttention(LlamaFlashGLA):
         value_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         landmark_mask: Optional[torch.Tensor] = None,
+        attention_mask_2d: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Eager landmark attention (FlashAttention does not support this sparsity pattern directly).
-        bsz, q_len, nheads, dim = query_states.shape
+        dropout_p = float(self.attention_dropout) if self.training else 0.0
 
-        q = query_states.transpose(1, 2)  # (B, H, S, D)
-        k = key_states.transpose(1, 2)
-        v = value_states.transpose(1, 2)
+        # Landmark attention is implemented eagerly (no FlashAttention kernel for this sparsity pattern).
+        # Prefer `attention_mask_2d` (padding) to avoid relying on a dense 4D additive mask.
+        return _budgie_landmark_attention(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            attention_mask_2d=attention_mask_2d if attention_mask_2d is not None else (attention_mask if attention_mask is not None and attention_mask.dim() == 2 else None),
+            landmark_mask=landmark_mask,
+            landmark_every=self.landmark_every,
+            dropout_p=dropout_p,
+            is_causal=bool(self.is_causal),
+        )
 
-        scale = dim**-0.5
-        attn_scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-2, -1)) * scale  # (B, H, S, S)
 
-        positions = torch.arange(q_len, device=attn_scores.device)
-        causal = positions[:, None] >= positions[None, :]  # (S, S)
 
-        if landmark_mask is not None:
-            if landmark_mask.shape != (bsz, q_len):
-                raise ValueError(f"`landmark_mask` must have shape {(bsz, q_len)}, got {tuple(landmark_mask.shape)}.")
-            is_landmark = landmark_mask.to(torch.bool)  # (B, S)
+class BudgieGLASharedHybrid(LlamaGLA):
+    """
+    Shared GLA attention that can switch between algorithms per call.
+
+    Use with `attn_mode`:
+    - `"sliding"`: causal sliding-window attention (uses xFormers if enabled/supported, otherwise eager).
+    - `"landmark"`: eager landmark attention (block-local + global landmarks).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sliding_window = getattr(self.config, "sliding_window", None)
+        self.landmark_every = getattr(self.config, "landmark_every", None)
+        if self.landmark_every is not None and (not isinstance(self.landmark_every, int) or self.landmark_every <= 0):
+            raise ValueError("If set, `config.landmark_every` must be a positive int.")
+
+    def _flash_attn_sliding(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        attention_mask_2d: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if flash_attn_func is None:
+            dropout_p = float(self.attention_dropout) if self.training else 0.0
+            return _budgie_xformers_attention(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                attention_mask_2d=attention_mask_2d,
+                dropout_p=dropout_p,
+                is_causal=bool(self.is_causal),
+                sliding_window=int(self.sliding_window) if self.sliding_window is not None else None,
+                allow_xformers_op=bool(getattr(self.config, "use_xformers", False)),
+            )
+
+        if not isinstance(self.sliding_window, int) or self.sliding_window <= 0:
+            raise ValueError("Sliding-window mode requires `config.sliding_window` to be a positive int.")
+
+        try:
+            attn_output, _ = flash_attn_func(
+                q=query_states,
+                k=key_states,
+                v=value_states,
+                causal=self.is_causal,
+                window_size=(self.sliding_window, 0),
+            )
+        except TypeError:
+            try:
+                attn_output, _ = flash_attn_func(
+                    q=query_states,
+                    k=key_states,
+                    v=value_states,
+                    causal=self.is_causal,
+                    window_size=self.sliding_window,
+                )
+            except TypeError:
+                attn_output, _ = flash_attn_func(
+                    q=query_states,
+                    k=key_states,
+                    v=value_states,
+                    causal=self.is_causal,
+                    window_size_left=self.sliding_window,
+                    window_size_right=0,
+                )
+        return attn_output
+
+    def _flash_attn_landmark(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        *,
+        attention_mask: Optional[torch.Tensor],
+        landmark_mask: Optional[torch.Tensor],
+        attention_mask_2d: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        dropout_p = float(self.attention_dropout) if self.training else 0.0
+        return _budgie_landmark_attention(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            attention_mask_2d=attention_mask_2d if attention_mask_2d is not None else (attention_mask if attention_mask is not None and attention_mask.dim() == 2 else None),
+            landmark_mask=landmark_mask,
+            landmark_every=self.landmark_every,
+            dropout_p=dropout_p,
+            is_causal=bool(self.is_causal),
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        attn_mode = kwargs.get("attn_mode", None)
+        if attn_mode not in ("sliding", "landmark"):
+            raise ValueError("BudgieGLASharedHybrid requires `attn_mode` to be either 'sliding' or 'landmark'.")
+
+        bsz, q_len, _ = hidden_states.size()
+
+        q_proj = self.W_dQ(hidden_states)
+        query_states = self.q_norm(q_proj)
+        query_states = self.W_uQ_rope(query_states).view(bsz, q_len, self.num_heads, self.head_dim + self.rope_dim)
+        query_rope = query_states[..., self.head_dim:]
+
+        KV_compressed_cache = self.W_dKV(hidden_states)
+        compressed_kv, key_rope = torch.split(KV_compressed_cache, [self.kv_proj_dim, self.rope_dim], dim=-1)
+        key_rope = key_rope.view(bsz, q_len, 1, self.rope_dim)
+
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(query_rope, position_ids)
         else:
-            if not isinstance(self.landmark_every, int) or self.landmark_every <= 0:
-                raise ValueError("Positional landmarks require `config.landmark_every` to be a positive int.")
-            is_landmark = (((positions + 1) % self.landmark_every) == 0)[None, :].expand(bsz, -1)  # (B, S)
+            cos, sin = position_embeddings
 
-        # Assign each position to a block so that a landmark shares the same block id as the tokens before it.
-        block_id = torch.cumsum(is_landmark.to(torch.int32), dim=1) - is_landmark.to(torch.int32)  # (B, S)
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            effective_layer_idx = kwargs.get("layer_idx", self.layer_idx)
+            compressed_kv, key_rope = past_key_value.update(
+                compressed_kv.unsqueeze(2), key_rope, effective_layer_idx, cache_kwargs
+            )
 
-        same_block = block_id[:, :, None].eq(block_id[:, None, :])  # (B, S, S)
-        allowed = causal[None, :, :] & (is_landmark[:, None, :] | same_block)  # (B, S, S)
+        key_states = torch.zeros_like(query_states)
+        value_states = torch.zeros_like(query_states)
 
-        min_val = torch.finfo(attn_scores.dtype).min
-        attn_scores = attn_scores.masked_fill(~allowed[:, None, :, :], min_val)
+        latent_dim_per_head = self.kv_proj_dim // 2
+        half_heads = self.num_heads // 2
 
-        if attention_mask is not None:
-            # `attention_mask` is expected to be additive (e.g. 4D causal mask with -inf on masked positions).
-            if attention_mask.dim() == 4:
-                attn_scores = attn_scores + attention_mask[:, :, :q_len, :q_len].to(attn_scores.dtype)
-            elif attention_mask.dim() == 2:
-                # (B, S) padding mask: 1 for keep, 0 for pad.
-                key_keep = attention_mask.to(dtype=torch.bool)[:, None, None, :]
-                attn_scores = attn_scores.masked_fill(~key_keep, min_val)
+        kv_first_half = compressed_kv[..., :latent_dim_per_head]
+        kv_first_half = self.kv_norm_1(kv_first_half)
+        KV_compressed_1 = self.W_ukv_1(kv_first_half)
+        KV_compressed_1 = KV_compressed_1.view(bsz, q_len, half_heads, 2 * self.head_dim)
 
-        attn_probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_probs, v.to(attn_probs.dtype))  # (B, H, S, D)
-        return attn_output.transpose(1, 2).contiguous()
+        key_states[:, :, :half_heads, :self.head_dim] = KV_compressed_1[:, :, :, :self.head_dim]
+        value_states[:, :, :half_heads, :self.head_dim] = KV_compressed_1[:, :, :, self.head_dim:]
+
+        kv_second_half = compressed_kv[..., latent_dim_per_head:]
+        kv_second_half = self.kv_norm_2(kv_second_half)
+        KV_compressed_2 = self.W_ukv_2(kv_second_half)
+        KV_compressed_2 = KV_compressed_2.view(bsz, q_len, half_heads, 2 * self.head_dim)
+
+        key_states[:, :, half_heads:, :self.head_dim] = KV_compressed_2[:, :, :, :self.head_dim]
+        value_states[:, :, half_heads:, :self.head_dim] = KV_compressed_2[:, :, :, self.head_dim:]
+
+        query_rope, key_rope = apply_rotary_pos_emb(query_rope, key_rope, cos, sin, unsqueeze_dim=2)
+        query_states[..., self.head_dim:].copy_(query_rope)
+        key_states[..., self.head_dim:].copy_(key_rope)
+
+        if attn_mode == "sliding":
+            attn_output = self._flash_attn_sliding(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                attention_mask_2d=kwargs.get("attention_mask_2d"),
+            )
+        else:
+            attn_output = self._flash_attn_landmark(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                attention_mask=attention_mask,
+                landmark_mask=kwargs.get("landmark_mask"),
+                attention_mask_2d=kwargs.get("attention_mask_2d"),
+            )
+
+        attn_output = attn_output[..., :self.head_dim].contiguous()
+        attn_output = attn_output.view(bsz, q_len, -1)
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            return attn_output, None, past_key_value
+        return attn_output, None, past_key_value
 
 
+
+LlamaFlashGLA = LlamaGLA
+BudgieFlashGLASlidingWindowAttention = BudgieGLASlidingWindowAttention
+BudgieFlashGLALandmarkAttention = BudgieGLALandmarkAttention
+BudgieFlashGLASharedHybrid = BudgieGLASharedHybrid
 
 LLAMA_ATTENTION_CLASSES = {
     "eager": LlamaAttention,
-    "sdpa": LlamaFlashGLA,
-    "gla_sliding": BudgieFlashGLASlidingWindowAttention,
-    "gla_landmark": BudgieFlashGLALandmarkAttention,
+    "sdpa": LlamaGLA,
+    "gla_sliding": BudgieGLASlidingWindowAttention,
+    "gla_landmark": BudgieGLALandmarkAttention,
 }
 
 
@@ -816,9 +1592,9 @@ class LlamaDecoderLayer(nn.Module):
         impl = attn_implementation if attn_implementation is not None else config._attn_implementation
         self.self_attn = LLAMA_ATTENTION_CLASSES[impl](config=config, layer_idx=layer_idx)
 
-        self.mlp = LlamaMLP(config)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = budgie_make_mlp(config)
+        self.input_layernorm = budgie_make_rmsnorm(config, config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = budgie_make_rmsnorm(config, config.hidden_size, config.rms_norm_eps)
 
         if enable_tiny_conv is None:
             enable_tiny_conv = bool(getattr(config, "use_tiny_conv", False))
@@ -827,7 +1603,14 @@ class LlamaDecoderLayer(nn.Module):
             kernel_size = int(getattr(config, "tiny_conv_kernel_size", 3))
             bias = bool(getattr(config, "tiny_conv_bias", False))
             init_zero = bool(getattr(config, "tiny_conv_init_zero", True))
-            self.tiny_conv = BudgieCausalDepthwiseConv1d(config.hidden_size, kernel_size=kernel_size, bias=bias, init_zero=init_zero)
+            use_causal_conv1d = bool(getattr(config, "use_causal_conv1d", True))
+            self.tiny_conv = BudgieCausalDepthwiseConv1d(
+                config.hidden_size,
+                kernel_size=kernel_size,
+                bias=bias,
+                init_zero=init_zero,
+                use_causal_conv1d=use_causal_conv1d,
+            )
         else:
             self.tiny_conv = None
 
