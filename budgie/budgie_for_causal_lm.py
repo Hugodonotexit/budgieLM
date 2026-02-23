@@ -15,7 +15,11 @@ from transformers.utils import is_torchdynamo_compiling, logging
 from .budgie_config import BudgieConfig
 from .budgie_model import BudgieModel
 from .budgie_pretrained_model import BudgiePreTrainedModel
-from .modeling_budgie_GLA import _prepare_4d_causal_attention_mask_with_cache_position
+from .modeling_budgie_GLA import (
+    _LIGER_CE_LOSS_CLS,
+    _LIGER_FUSED_LINEAR_CE_LOSS_CLS,
+    _prepare_4d_causal_attention_mask_with_cache_position,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -29,6 +33,10 @@ class BudgieForCausalLM(BudgiePreTrainedModel, GenerationMixin):
         self.model = BudgieModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self._liger_ce_loss_fn = None
+        self._liger_fused_linear_ce_loss_fn = None
+        self._liger_ce_disabled = False
+        self._liger_fused_linear_ce_disabled = False
 
         self.post_init()
         self.tie_weights()
@@ -95,26 +103,103 @@ class BudgieForCausalLM(BudgiePreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs[0]
-        if self.config.pretraining_tp > 1:
-            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
-            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
-            logits = torch.cat(logits, dim=-1)
-        else:
+        use_liger_kernel = bool(getattr(self.config, "use_liger_kernel", False))
+
+        loss = None
+        used_fused_linear_ce = False
+        if labels is not None and use_liger_kernel and not self._liger_fused_linear_ce_disabled:
+            fused_cls = _LIGER_FUSED_LINEAR_CE_LOSS_CLS
+            if fused_cls is not None and int(getattr(self.config, "pretraining_tp", 1)) == 1:
+                if self._liger_fused_linear_ce_loss_fn is None:
+                    try:  # pragma: no cover
+                        if isinstance(fused_cls, type):
+                            try:
+                                self._liger_fused_linear_ce_loss_fn = fused_cls(ignore_index=-100)
+                            except TypeError:
+                                self._liger_fused_linear_ce_loss_fn = fused_cls()
+                        else:
+                            self._liger_fused_linear_ce_loss_fn = fused_cls
+                    except Exception as exc:
+                        self._liger_fused_linear_ce_disabled = True
+                        logger.warning_once(
+                            f"Failed to initialize LigerFusedLinearCrossEntropyLoss; falling back. Error: {exc}"
+                        )
+
+                if self._liger_fused_linear_ce_loss_fn is not None and not self._liger_fused_linear_ce_disabled:
+                    hs = hidden_states[:, :-1, :].contiguous()
+                    tgt = labels[:, 1:].contiguous()
+                    w = self.lm_head.weight
+                    loss_fn = self._liger_fused_linear_ce_loss_fn
+                    try:  # pragma: no cover
+                        try:
+                            loss = loss_fn(hs, w, tgt)
+                        except TypeError:
+                            loss = loss_fn(w, hs, tgt)
+                    except TypeError:  # pragma: no cover
+                        hs_f = hs.reshape(-1, hs.shape[-1])
+                        tgt_f = tgt.reshape(-1)
+                        try:
+                            loss = loss_fn(hs_f, w, tgt_f)
+                        except TypeError:
+                            loss = loss_fn(w, hs_f, tgt_f)
+                    except Exception as exc:
+                        self._liger_fused_linear_ce_disabled = True
+                        logger.warning_once(
+                            f"LigerFusedLinearCrossEntropyLoss failed at runtime; falling back. Error: {exc}"
+                        )
+                        loss = None
+                    else:
+                        used_fused_linear_ce = True
+
+        # Compute logits (optionally detached under fused CE during training).
+        def _compute_logits() -> torch.Tensor:
+            if self.config.pretraining_tp > 1:
+                lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
+                logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
+                return torch.cat(logits, dim=-1)
             if labels is None and not is_torchdynamo_compiling():
                 logger.warning_once(
                     "Starting from v4.46, the `logits` model output will have the same type as the model (except at "
                     "train time, where it will always be FP32)"
                 )
-            logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :]).float()
+            return self.lm_head(hidden_states[:, -num_logits_to_keep:, :]).float()
 
-        loss = None
-        if labels is not None:
-            logits = logits.float()
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+        if labels is not None and used_fused_linear_ce and self.training:
+            with torch.no_grad():
+                logits = _compute_logits()
+        else:
+            logits = _compute_logits()
+
+        if labels is not None and loss is None and use_liger_kernel and not self._liger_ce_disabled:
+            ce_cls = _LIGER_CE_LOSS_CLS
+            if ce_cls is not None:
+                if self._liger_ce_loss_fn is None:
+                    try:  # pragma: no cover
+                        if isinstance(ce_cls, type):
+                            try:
+                                self._liger_ce_loss_fn = ce_cls(ignore_index=-100)
+                            except TypeError:
+                                self._liger_ce_loss_fn = ce_cls()
+                        else:
+                            self._liger_ce_loss_fn = ce_cls
+                    except Exception as exc:
+                        self._liger_ce_disabled = True
+                        logger.warning_once(f"Failed to initialize LigerCrossEntropyLoss; falling back. Error: {exc}")
+
+                if self._liger_ce_loss_fn is not None and not self._liger_ce_disabled:
+                    try:  # pragma: no cover
+                        shift_logits = logits.float()[..., :-1, :].contiguous().view(-1, self.config.vocab_size)
+                        shift_labels = labels[..., 1:].contiguous().view(-1).to(shift_logits.device)
+                        loss = self._liger_ce_loss_fn(shift_logits, shift_labels)
+                    except Exception as exc:
+                        self._liger_ce_disabled = True
+                        logger.warning_once(f"LigerCrossEntropyLoss failed at runtime; falling back. Error: {exc}")
+                        loss = None
+
+        if labels is not None and loss is None:
+            shift_logits = logits.float()[..., :-1, :].contiguous().view(-1, self.config.vocab_size)
+            shift_labels = labels[..., 1:].contiguous().view(-1).to(shift_logits.device)
             loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1).to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:

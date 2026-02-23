@@ -79,6 +79,31 @@ Optional conditioning:
 - `share_all_layers=True` shares **one attention+MLP core** across all layers.
 - LayerNorms (and optional conv scaffolds) remain per-layer.
 
+### GLA grouping
+
+- `gla_num_groups` controls how many **latent groups** are used inside Budgie’s `LlamaGLA` implementation.
+  - Default is `2` (historical behavior).
+  - Must divide `num_attention_heads`.
+  - In this implementation, increasing groups increases the compressed KV projection size (more parameters/compute).
+
+### Liger kernels (optional)
+
+With `use_liger_kernel=True` and `liger_kernel` installed, Budgie will opportunistically use Liger kernels when
+available:
+
+- `LigerRMSNorm` + `LigerSwiGLUMLP` (existing)
+- `experimental.LigerEmbedding` (when available)
+- `liger_rotary_pos_emb` (when available)
+- `LigerSoftmax` in eager attention paths (when available)
+- `LigerFusedLinearCrossEntropyLoss` for training loss (otherwise `LigerCrossEntropyLoss`, otherwise PyTorch CE)
+
+If a kernel can’t be imported or fails at runtime, Budgie falls back to the PyTorch implementation.
+
+Notes:
+- `LigerEmbedding` is experimental.
+- When fused linear+CE is used during training, logits are still returned but computed under `torch.no_grad()` to
+  reduce VRAM.
+
 ## Notes for older GPUs (e.g., V100 / sm70)
 
 - Budgie uses SDPA/eager attention paths; Hopper-only FlashAttention is not required.

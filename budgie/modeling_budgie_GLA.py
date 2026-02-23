@@ -96,6 +96,12 @@ except Exception as exc:  # pragma: no cover
 _liger_import_error = None
 _LIGER_RMSNORM_CLS = None
 _LIGER_SWIGLU_MLP_CLS = None
+_liger_rotary_pos_emb = None
+_LIGER_SOFTMAX = None
+_LIGER_CE_LOSS_CLS = None
+_LIGER_FUSED_LINEAR_CE_LOSS_CLS = None
+_liger_experimental_import_error = None
+_LIGER_EMBEDDING_CLS = None
 for _liger_mod_name in (
     "liger_kernel.transformers",
     "liger_kernel.transformers.layers",
@@ -107,10 +113,34 @@ for _liger_mod_name in (
         _liger_import_error = exc
         continue
 
-    _LIGER_RMSNORM_CLS = getattr(_liger_mod, "LigerRMSNorm", None)
-    _LIGER_SWIGLU_MLP_CLS = getattr(_liger_mod, "LigerSwiGLUMLP", None)
-    if _LIGER_RMSNORM_CLS is not None or _LIGER_SWIGLU_MLP_CLS is not None:
+    if _LIGER_RMSNORM_CLS is None:
+        _LIGER_RMSNORM_CLS = getattr(_liger_mod, "LigerRMSNorm", None)
+    if _LIGER_SWIGLU_MLP_CLS is None:
+        _LIGER_SWIGLU_MLP_CLS = getattr(_liger_mod, "LigerSwiGLUMLP", None)
+    if _liger_rotary_pos_emb is None:
+        _liger_rotary_pos_emb = getattr(_liger_mod, "liger_rotary_pos_emb", None)
+    if _LIGER_SOFTMAX is None:
+        _LIGER_SOFTMAX = getattr(_liger_mod, "LigerSoftmax", None)
+    if _LIGER_CE_LOSS_CLS is None:
+        _LIGER_CE_LOSS_CLS = getattr(_liger_mod, "LigerCrossEntropyLoss", None)
+    if _LIGER_FUSED_LINEAR_CE_LOSS_CLS is None:
+        _LIGER_FUSED_LINEAR_CE_LOSS_CLS = getattr(_liger_mod, "LigerFusedLinearCrossEntropyLoss", None)
+
+    if (
+        _LIGER_RMSNORM_CLS is not None
+        and _LIGER_SWIGLU_MLP_CLS is not None
+        and _liger_rotary_pos_emb is not None
+        and _LIGER_SOFTMAX is not None
+        and _LIGER_CE_LOSS_CLS is not None
+        and _LIGER_FUSED_LINEAR_CE_LOSS_CLS is not None
+    ):
         break
+
+try:  # pragma: no cover
+    _liger_exp_mod = importlib.import_module("liger_kernel.transformers.experimental")
+    _LIGER_EMBEDDING_CLS = getattr(_liger_exp_mod, "LigerEmbedding", None)
+except Exception as exc:  # pragma: no cover
+    _liger_experimental_import_error = exc
 
 if _LIGER_RMSNORM_CLS is not None:  # pragma: no cover
     ALL_LAYERNORM_LAYERS.append(_LIGER_RMSNORM_CLS)
@@ -422,6 +452,93 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+_LIGER_ROPE_VARIANT: dict[int, str | None] = {}
+
+
+def budgie_apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    unsqueeze_dim: int = 1,
+    use_liger_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not (use_liger_kernel and _liger_rotary_pos_emb is not None):
+        return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+
+    variant = _LIGER_ROPE_VARIANT.get(int(unsqueeze_dim), "__probe__")
+    if variant is None:
+        return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+
+    rotary_dim = min(q.shape[-1], k.shape[-1], cos.shape[-1], sin.shape[-1])
+    q_rot, k_rot = q[..., :rotary_dim], k[..., :rotary_dim]
+    cos_rot, sin_rot = cos[..., :rotary_dim], sin[..., :rotary_dim]
+
+    # `liger_rotary_pos_emb` expects Q/K in (B, H, S, D) layout. When callers provide (B, S, H, D)
+    # (i.e. `unsqueeze_dim=2`), transpose into the expected layout before invoking Liger, then transpose back.
+    if q_rot.ndim != 4 or k_rot.ndim != 4:
+        return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    if int(unsqueeze_dim) == 1:
+        q_in, k_in = q_rot, k_rot
+        def _postprocess(q_out: torch.Tensor, k_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return q_out, k_out
+    elif int(unsqueeze_dim) == 2:
+        q_in, k_in = q_rot.transpose(1, 2), k_rot.transpose(1, 2)
+        def _postprocess(q_out: torch.Tensor, k_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return q_out.transpose(1, 2), k_out.transpose(1, 2)
+    else:
+        # Unknown layout for Liger; fall back to the reference implementation.
+        return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+
+    liger_unsqueeze_dim = 1  # Q/K are passed to Liger in (B, H, S, D) layout.
+
+    def run_variant(name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        if name == "kw_unsqueeze_dim":
+            q_out, k_out = _liger_rotary_pos_emb(q_in, k_in, cos_rot, sin_rot, unsqueeze_dim=liger_unsqueeze_dim)
+            return _postprocess(q_out, k_out)
+        if name == "pos_args":
+            q_out, k_out = _liger_rotary_pos_emb(q_in, k_in, cos_rot, sin_rot)
+            return _postprocess(q_out, k_out)
+        if name == "pos_args_unsqueezed":
+            q_out, k_out = _liger_rotary_pos_emb(
+                q_in,
+                k_in,
+                cos_rot.unsqueeze(liger_unsqueeze_dim),
+                sin_rot.unsqueeze(liger_unsqueeze_dim),
+            )
+            return _postprocess(q_out, k_out)
+        raise ValueError(f"Unknown Liger RoPE variant {name!r}.")
+
+    try:  # pragma: no cover
+        if variant == "__probe__":
+            for name in ("kw_unsqueeze_dim", "pos_args", "pos_args_unsqueezed"):
+                try:
+                    q_embed, k_embed = run_variant(name)
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+                if q_embed.shape == q_rot.shape and k_embed.shape == k_rot.shape:
+                    _LIGER_ROPE_VARIANT[int(unsqueeze_dim)] = name
+                    break
+            else:
+                _LIGER_ROPE_VARIANT[int(unsqueeze_dim)] = None
+                return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+        else:
+            q_embed, k_embed = run_variant(variant)
+    except Exception as exc:
+        _LIGER_ROPE_VARIANT[int(unsqueeze_dim)] = None
+        logger.warning_once(f"Failed to use liger_rotary_pos_emb; falling back to torch RoPE. Error: {exc}")
+        return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+
+    if q.shape[-1] > rotary_dim:
+        q_embed = torch.cat([q_embed, q[..., rotary_dim:]], dim=-1)
+    if k.shape[-1] > rotary_dim:
+        k_embed = torch.cat([k_embed, k[..., rotary_dim:]], dim=-1)
+    return q_embed, k_embed
+
+
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
@@ -442,6 +559,26 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    # Some architectures apply RoPE only to a subset of the head dimension (e.g. `qk_rope_dim`), while other parts of
+    # Q/K remain unrotated. In those cases, `cos/sin` can be larger than the incoming `q/k` slice (or vice-versa, if a
+    # slice larger than RoPE dim is passed). Be defensive and apply RoPE to the shared prefix.
+    if cos.shape[-1] != q.shape[-1] or sin.shape[-1] != q.shape[-1]:
+        rotary_dim = min(q.shape[-1], k.shape[-1], cos.shape[-1], sin.shape[-1])
+        q_rot, k_rot = q[..., :rotary_dim], k[..., :rotary_dim]
+        cos = cos[..., :rotary_dim]
+        sin = sin[..., :rotary_dim]
+
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+        q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+        k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+
+        if q.shape[-1] > rotary_dim:
+            q_embed = torch.cat([q_embed, q[..., rotary_dim:]], dim=-1)
+        if k.shape[-1] > rotary_dim:
+            k_embed = torch.cat([k_embed, k[..., rotary_dim:]], dim=-1)
+        return q_embed, k_embed
+
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -528,6 +665,61 @@ def budgie_make_mlp(config):
     return LlamaMLP(config)
 
 
+def budgie_make_embedding(config, vocab_size: int, hidden_size: int, padding_idx: int):
+    if bool(getattr(config, "use_liger_kernel", False)) and _LIGER_EMBEDDING_CLS is not None:
+        try:  # pragma: no cover
+            emb = _LIGER_EMBEDDING_CLS(vocab_size, hidden_size, padding_idx=padding_idx)
+        except TypeError:
+            try:
+                emb = _LIGER_EMBEDDING_CLS(vocab_size, hidden_size, padding_idx)
+            except TypeError:
+                try:
+                    emb = _LIGER_EMBEDDING_CLS(vocab_size, hidden_size)
+                except Exception as exc:
+                    logger.warning_once(f"Failed to create LigerEmbedding; falling back to nn.Embedding. Error: {exc}")
+                    emb = None
+            except Exception as exc:
+                logger.warning_once(f"Failed to create LigerEmbedding; falling back to nn.Embedding. Error: {exc}")
+                emb = None
+        except Exception as exc:
+            logger.warning_once(f"Failed to create LigerEmbedding; falling back to nn.Embedding. Error: {exc}")
+            emb = None
+
+        if emb is not None and hasattr(emb, "weight"):
+            return emb
+
+    return nn.Embedding(vocab_size, hidden_size, padding_idx)
+
+
+_LIGER_SOFTMAX_FN = None
+_LIGER_SOFTMAX_DISABLED = False
+
+
+def budgie_softmax(scores: torch.Tensor, *, use_liger_kernel: bool, dim: int = -1, dtype: torch.dtype = torch.float32):
+    global _LIGER_SOFTMAX_FN, _LIGER_SOFTMAX_DISABLED
+    if not (use_liger_kernel and _LIGER_SOFTMAX is not None and dim == -1) or _LIGER_SOFTMAX_DISABLED:
+        return torch.softmax(scores, dim=dim, dtype=dtype)
+    if _LIGER_SOFTMAX_FN is None:
+        try:
+            _LIGER_SOFTMAX_FN = _LIGER_SOFTMAX() if isinstance(_LIGER_SOFTMAX, type) else _LIGER_SOFTMAX
+        except Exception as exc:
+            _LIGER_SOFTMAX_DISABLED = True
+            logger.warning_once(f"Failed to initialize LigerSoftmax; falling back to torch.softmax. Error: {exc}")
+            return torch.softmax(scores, dim=dim, dtype=dtype)
+
+    try:  # pragma: no cover
+        # Prefer float32 softmax (common for stability), but fall back if the kernel doesn't support it.
+        try:
+            out = _LIGER_SOFTMAX_FN(scores.float())
+            return out.to(dtype=scores.dtype)
+        except Exception:
+            return _LIGER_SOFTMAX_FN(scores)
+    except Exception as exc:
+        _LIGER_SOFTMAX_DISABLED = True
+        logger.warning_once(f"Failed to run LigerSoftmax; falling back to torch.softmax. Error: {exc}")
+        return torch.softmax(scores, dim=dim, dtype=dtype)
+
+
 def _budgie_xformers_attention(
     *,
     query_states: torch.Tensor,  # (B, S_q, H, D)
@@ -538,6 +730,7 @@ def _budgie_xformers_attention(
     is_causal: bool,
     sliding_window: Optional[int] = None,
     allow_xformers_op: bool = True,
+    use_liger_kernel: bool = False,
 ) -> torch.Tensor:
     q = query_states.contiguous()
     k = key_states.contiguous()
@@ -697,7 +890,9 @@ def _budgie_xformers_attention(
                 keep_range = key_keep_full[:, key_start:key_end]  # (B, K)
                 attn_scores = attn_scores.masked_fill(~keep_range[:, None, None, :], min_val)
 
-            attn_probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+            attn_probs = budgie_softmax(
+                attn_scores, use_liger_kernel=use_liger_kernel, dim=-1, dtype=torch.float32
+            ).to(q.dtype)
             if dropout_p and dropout_p > 0:
                 attn_probs = nn.functional.dropout(attn_probs, p=dropout_p, training=True)
 
@@ -724,7 +919,7 @@ def _budgie_xformers_attention(
             raise ValueError(f"`attention_mask_2d` must have shape {(bsz, k_len)}, got {tuple(key_keep.shape)}.")
         attn_scores = attn_scores.masked_fill(~key_keep[:, None, None, :], min_val)
 
-    attn_probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+    attn_probs = budgie_softmax(attn_scores, use_liger_kernel=use_liger_kernel, dim=-1, dtype=torch.float32).to(q.dtype)
     if dropout_p and dropout_p > 0:
         attn_probs = nn.functional.dropout(attn_probs, p=dropout_p, training=True)
 
@@ -742,6 +937,7 @@ def _budgie_landmark_attention(
     landmark_every: Optional[int],  # positional landmarks
     dropout_p: float,
     is_causal: bool,
+    use_liger_kernel: bool = False,
 ) -> torch.Tensor:
     """
     Memory-efficient eager landmark attention.
@@ -840,7 +1036,9 @@ def _budgie_landmark_attention(
                     scores_lm = scores_lm.masked_fill(~keep_lm[:, None, None, :], min_val)
 
                 scores = torch.cat([scores_local, scores_lm], dim=-1)
-                probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(dtype=q.dtype)
+                probs = budgie_softmax(scores, use_liger_kernel=use_liger_kernel, dim=-1, dtype=torch.float32).to(
+                    dtype=q.dtype
+                )
                 if dropout_p and dropout_p > 0:
                     probs = nn.functional.dropout(probs, p=dropout_p, training=True)
 
@@ -849,7 +1047,9 @@ def _budgie_landmark_attention(
                 out_block = torch.matmul(probs_local, v_local.to(dtype=probs.dtype)).to(dtype=q.dtype)
                 out_block = out_block + torch.matmul(probs_lm, v_lm.to(dtype=probs.dtype)).to(dtype=q.dtype)
             else:
-                probs = torch.softmax(scores_local, dim=-1, dtype=torch.float32).to(dtype=q.dtype)
+                probs = budgie_softmax(
+                    scores_local, use_liger_kernel=use_liger_kernel, dim=-1, dtype=torch.float32
+                ).to(dtype=q.dtype)
                 if dropout_p and dropout_p > 0:
                     probs = nn.functional.dropout(probs, p=dropout_p, training=True)
                 out_block = torch.matmul(probs, v_local.to(dtype=probs.dtype)).to(dtype=q.dtype)
@@ -923,7 +1123,9 @@ def _budgie_landmark_attention(
                         scores_lm = scores_lm.masked_fill(~keep_lm[None, None, :], min_val)
 
                 scores = torch.cat([scores_local, scores_lm], dim=-1)
-                probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(dtype=q.dtype)
+                probs = budgie_softmax(scores, use_liger_kernel=use_liger_kernel, dim=-1, dtype=torch.float32).to(
+                    dtype=q.dtype
+                )
                 if dropout_p and dropout_p > 0:
                     probs = nn.functional.dropout(probs, p=dropout_p, training=True)
 
@@ -932,7 +1134,9 @@ def _budgie_landmark_attention(
                 out_block = torch.matmul(probs_local, v_local.to(dtype=probs.dtype)).to(dtype=q.dtype)
                 out_block = out_block + torch.matmul(probs_lm, v_lm.to(dtype=probs.dtype)).to(dtype=q.dtype)
             else:
-                probs = torch.softmax(scores_local, dim=-1, dtype=torch.float32).to(dtype=q.dtype)
+                probs = budgie_softmax(
+                    scores_local, use_liger_kernel=use_liger_kernel, dim=-1, dtype=torch.float32
+                ).to(dtype=q.dtype)
                 if dropout_p and dropout_p > 0:
                     probs = nn.functional.dropout(probs, p=dropout_p, training=True)
                 out_block = torch.matmul(probs, v_local.to(dtype=probs.dtype)).to(dtype=q.dtype)
@@ -1037,7 +1241,14 @@ class LlamaAttention(nn.Module):
             cos, sin = self.rotary_emb(value_states, position_ids)
         else:
             cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = budgie_apply_rotary_pos_emb(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            unsqueeze_dim=1,
+            use_liger_kernel=bool(getattr(self.config, "use_liger_kernel", False)),
+        )
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -1089,14 +1300,29 @@ class LlamaGLA(LlamaAttention):
         super().__init__(*args, **kwargs)
         
         
-        self.kv_proj_dim = 4 * self.head_dim   #2 latent heads each 2*d 
+        self.gla_num_groups = int(getattr(self.config, "gla_num_groups", 2))
+        if self.gla_num_groups <= 0:
+            raise ValueError(f"`config.gla_num_groups` must be a positive int, got {self.gla_num_groups}.")
+        if self.num_heads % self.gla_num_groups != 0:
+            raise ValueError(
+                "`config.gla_num_groups` must divide `config.num_attention_heads`. "
+                f"Got gla_num_groups={self.gla_num_groups}, num_attention_heads={self.num_heads}."
+            )
+        self.heads_per_group = self.num_heads // self.gla_num_groups
+
+        # Keep the historical design: each group has a latent size of 2*head_dim (and is then expanded to
+        # heads_per_group * 2*head_dim to produce per-head K and V).
+        self.latent_dim_per_group = 2 * self.head_dim
+
+        self.kv_proj_dim = self.gla_num_groups * self.latent_dim_per_group
         self.q_proj_dim = 8 * self.head_dim
 
         self.q_norm = budgie_make_rmsnorm(self.config, self.q_proj_dim, self.config.rms_norm_eps)
 
 
-        self.kv_norm_1 = budgie_make_rmsnorm(self.config, self.kv_proj_dim // 2, self.config.rms_norm_eps)
-        self.kv_norm_2 = budgie_make_rmsnorm(self.config, self.kv_proj_dim // 2, self.config.rms_norm_eps)
+        self.kv_norms = nn.ModuleList(
+            [budgie_make_rmsnorm(self.config, self.latent_dim_per_group, self.config.rms_norm_eps) for _ in range(self.gla_num_groups)]
+        )
 
 
         #Query
@@ -1107,8 +1333,12 @@ class LlamaGLA(LlamaAttention):
         self.W_dKV = nn.Linear(self.hidden_size, self.kv_proj_dim + self.rope_dim) 
         
         
-        self.W_ukv_1 = nn.Linear(self.kv_proj_dim // 2, (self.num_heads * self.head_dim)) 
-        self.W_ukv_2 = nn.Linear(self.kv_proj_dim // 2, (self.num_heads * self.head_dim)) 
+        self.W_ukvs = nn.ModuleList(
+            [
+                nn.Linear(self.latent_dim_per_group, self.heads_per_group * (2 * self.head_dim))
+                for _ in range(self.gla_num_groups)
+            ]
+        )
 
 
 
@@ -1155,6 +1385,7 @@ class LlamaGLA(LlamaAttention):
             is_causal=bool(self.is_causal),
             sliding_window=None,
             allow_xformers_op=bool(getattr(self.config, "use_xformers", False)),
+            use_liger_kernel=bool(getattr(self.config, "use_liger_kernel", False)),
         )
         return out
 
@@ -1209,33 +1440,28 @@ class LlamaGLA(LlamaAttention):
         value_states = torch.zeros_like(query_states) # pad zeros for the extra dimension since there is no decoupled RoPE for V and FA doesn't support QKV withe value states
 
         
-        latent_dim_per_head = self.kv_proj_dim // 2        
-        half_heads  = self.num_heads // 2         
+        latent_dim = self.latent_dim_per_group
+        heads_per_group = self.heads_per_group
+        for g in range(self.gla_num_groups):
+            head_start = g * heads_per_group
+            head_end = head_start + heads_per_group
 
-        # c_1= 2*d per head
-        kv_first_half   = compressed_kv[..., :latent_dim_per_head]          
-        kv_first_half   = self.kv_norm_1(kv_first_half)             
-        KV_compressed_1 = self.W_ukv_1(kv_first_half)               
-        KV_compressed_1 = KV_compressed_1.view(bsz, q_len, half_heads, 2 * self.head_dim)
+            kv_g = compressed_kv[..., (g * latent_dim) : ((g + 1) * latent_dim)]
+            kv_g = self.kv_norms[g](kv_g)
+            kv_out = self.W_ukvs[g](kv_g).view(bsz, q_len, heads_per_group, 2 * self.head_dim)
 
-        key_states[:, :, :half_heads, :self.head_dim]   = KV_compressed_1[:, :, :, :self.head_dim]   
-        value_states[:, :, :half_heads, :self.head_dim] = KV_compressed_1[:, :, :,  self.head_dim:]  
-
-        del kv_first_half, KV_compressed_1
-
-        # c_2 = 2*d per head
-        kv_second_half  = compressed_kv[..., latent_dim_per_head:]          
-        kv_second_half  = self.kv_norm_2(kv_second_half)           
-        KV_compressed_2 = self.W_ukv_2(kv_second_half)              
-        KV_compressed_2 = KV_compressed_2.view(bsz, q_len, half_heads, 2 * self.head_dim)
-
-        key_states[:, :, half_heads:, :self.head_dim]   = KV_compressed_2[:, :, :, :self.head_dim]   
-        value_states[:, :, half_heads:, :self.head_dim] = KV_compressed_2[:, :, :,  self.head_dim:]  
-
-        del kv_second_half, KV_compressed_2
+            key_states[:, :, head_start:head_end, :self.head_dim] = kv_out[..., : self.head_dim]
+            value_states[:, :, head_start:head_end, :self.head_dim] = kv_out[..., self.head_dim :]
 
 
-        query_rope, key_rope = apply_rotary_pos_emb(query_rope, key_rope, cos, sin, unsqueeze_dim=2)
+        query_rope, key_rope = budgie_apply_rotary_pos_emb(
+            query_rope,
+            key_rope,
+            cos,
+            sin,
+            unsqueeze_dim=2,
+            use_liger_kernel=bool(getattr(self.config, "use_liger_kernel", False)),
+        )
 
 
         query_states[..., self.head_dim:].copy_(query_rope)
@@ -1297,6 +1523,7 @@ class BudgieGLASlidingWindowAttention(LlamaGLA):
                 is_causal=bool(self.is_causal),
                 sliding_window=int(self.sliding_window),
                 allow_xformers_op=bool(getattr(self.config, "use_xformers", False)),
+                use_liger_kernel=bool(getattr(self.config, "use_liger_kernel", False)),
             )
 
         try:
@@ -1382,6 +1609,7 @@ class BudgieGLALandmarkAttention(LlamaGLA):
             landmark_every=self.landmark_every,
             dropout_p=dropout_p,
             is_causal=bool(self.is_causal),
+            use_liger_kernel=bool(getattr(self.config, "use_liger_kernel", False)),
         )
 
 
@@ -1420,6 +1648,7 @@ class BudgieGLASharedHybrid(LlamaGLA):
                 is_causal=bool(self.is_causal),
                 sliding_window=int(self.sliding_window) if self.sliding_window is not None else None,
                 allow_xformers_op=bool(getattr(self.config, "use_xformers", False)),
+                use_liger_kernel=bool(getattr(self.config, "use_liger_kernel", False)),
             )
 
         if not isinstance(self.sliding_window, int) or self.sliding_window <= 0:
@@ -1473,6 +1702,7 @@ class BudgieGLASharedHybrid(LlamaGLA):
             landmark_every=self.landmark_every,
             dropout_p=dropout_p,
             is_causal=bool(self.is_causal),
+            use_liger_kernel=bool(getattr(self.config, "use_liger_kernel", False)),
         )
 
     def forward(
@@ -1517,26 +1747,27 @@ class BudgieGLASharedHybrid(LlamaGLA):
         key_states = torch.zeros_like(query_states)
         value_states = torch.zeros_like(query_states)
 
-        latent_dim_per_head = self.kv_proj_dim // 2
-        half_heads = self.num_heads // 2
+        latent_dim = self.latent_dim_per_group
+        heads_per_group = self.heads_per_group
+        for g in range(self.gla_num_groups):
+            head_start = g * heads_per_group
+            head_end = head_start + heads_per_group
 
-        kv_first_half = compressed_kv[..., :latent_dim_per_head]
-        kv_first_half = self.kv_norm_1(kv_first_half)
-        KV_compressed_1 = self.W_ukv_1(kv_first_half)
-        KV_compressed_1 = KV_compressed_1.view(bsz, q_len, half_heads, 2 * self.head_dim)
+            kv_g = compressed_kv[..., (g * latent_dim) : ((g + 1) * latent_dim)]
+            kv_g = self.kv_norms[g](kv_g)
+            kv_out = self.W_ukvs[g](kv_g).view(bsz, q_len, heads_per_group, 2 * self.head_dim)
 
-        key_states[:, :, :half_heads, :self.head_dim] = KV_compressed_1[:, :, :, :self.head_dim]
-        value_states[:, :, :half_heads, :self.head_dim] = KV_compressed_1[:, :, :, self.head_dim:]
+            key_states[:, :, head_start:head_end, :self.head_dim] = kv_out[..., : self.head_dim]
+            value_states[:, :, head_start:head_end, :self.head_dim] = kv_out[..., self.head_dim :]
 
-        kv_second_half = compressed_kv[..., latent_dim_per_head:]
-        kv_second_half = self.kv_norm_2(kv_second_half)
-        KV_compressed_2 = self.W_ukv_2(kv_second_half)
-        KV_compressed_2 = KV_compressed_2.view(bsz, q_len, half_heads, 2 * self.head_dim)
-
-        key_states[:, :, half_heads:, :self.head_dim] = KV_compressed_2[:, :, :, :self.head_dim]
-        value_states[:, :, half_heads:, :self.head_dim] = KV_compressed_2[:, :, :, self.head_dim:]
-
-        query_rope, key_rope = apply_rotary_pos_emb(query_rope, key_rope, cos, sin, unsqueeze_dim=2)
+        query_rope, key_rope = budgie_apply_rotary_pos_emb(
+            query_rope,
+            key_rope,
+            cos,
+            sin,
+            unsqueeze_dim=2,
+            use_liger_kernel=bool(getattr(self.config, "use_liger_kernel", False)),
+        )
         query_states[..., self.head_dim:].copy_(query_rope)
         key_states[..., self.head_dim:].copy_(key_rope)
 

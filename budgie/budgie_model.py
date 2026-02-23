@@ -18,6 +18,7 @@ from .modeling_budgie_GLA import (
     LlamaDecoderLayer,
     LlamaRotaryEmbedding,
     _prepare_4d_causal_attention_mask_with_cache_position,
+    budgie_make_embedding,
     budgie_make_mlp,
     budgie_make_rmsnorm,
 )
@@ -55,7 +56,7 @@ class BudgieModel(BudgiePreTrainedModel):
         self.num_phases = int(getattr(config, "num_phases", 1))
         self.use_phase_layer_gates = bool(getattr(config, "use_phase_layer_gates", False))
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = budgie_make_embedding(config, config.vocab_size, config.hidden_size, self.padding_idx)
         share_all_layers = bool(getattr(config, "share_all_layers", False))
         use_hybrid_layers = bool(getattr(config, "use_hybrid_layers", False))
 
