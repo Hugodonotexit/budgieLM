@@ -12,9 +12,9 @@ class BudgieConfig(PretrainedConfig):
         # Core architecture
         # -----------------
         vocab_size: int = 32768,
-        hidden_size: int = 4096,
-        intermediate_size: int = int(4096*2.5),
-        num_hidden_layers: int = 24,
+        hidden_size: int = 2048,
+        intermediate_size: int = int(2048*4),
+        num_hidden_layers: int = 30,
 
         # -----------------
         # Attention (Q/K/V)
@@ -27,7 +27,7 @@ class BudgieConfig(PretrainedConfig):
         # ----------------------------
         # Context length / positions
         # ----------------------------
-        max_position_embeddings: int = 1024 * 16,
+        max_position_embeddings: int = 1024 * 8,
         # Alias for `max_position_embeddings` (often called "context length" in training code).
         context_length: int | None = None,
 
@@ -36,7 +36,7 @@ class BudgieConfig(PretrainedConfig):
         # -------------------------
         initializer_range: float = 0.02,
         rms_norm_eps: float = 1e-5,
-        use_cache: bool = False,
+        use_cache: bool = True,
 
         # ----------
         # Token ids
@@ -65,7 +65,7 @@ class BudgieConfig(PretrainedConfig):
         attention_bias: bool = False,
         attention_dropout: float = 0.01,
         mlp_bias: bool = False,
-        qk_rope_dim: int | None = None,
+        qk_rope_dim: int | None = 16,
 
         
         # --------
@@ -82,7 +82,7 @@ class BudgieConfig(PretrainedConfig):
         use_hybrid_layers: bool = True,
         local_attn_implementation: str = "gla_sliding",
         bridge_attn_implementation: str = "gla_landmark",
-        bridge_every_n_layers: int = 6,
+        bridge_every_n_layers: int = 4,
         bridge_layer_offset: int = 3,
 
         # ---------------------
@@ -96,7 +96,7 @@ class BudgieConfig(PretrainedConfig):
         # ----------------------
         # Sliding-window attention
         # ----------------------
-        sliding_window: int | None = 1024,
+        sliding_window: int | None = 512,
 
         # ------------------
         # Landmark attention
@@ -115,7 +115,7 @@ class BudgieConfig(PretrainedConfig):
         # Sharing / phases (opt-in)
         # -------------------------
         share_all_layers: bool = False,
-        num_phases: int = 3,
+        num_phases: int = 2,
         use_phase_layer_gates: bool = True,
 
         # -----------------------

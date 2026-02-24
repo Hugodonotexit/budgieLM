@@ -197,6 +197,7 @@ class BudgieModel(BudgiePreTrainedModel):
         scaffold: BudgieLayerScaffold,
         phase_idx: int,
         layer_idx: int,
+        virtual_layer_idx: int,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.LongTensor],
@@ -217,7 +218,7 @@ class BudgieModel(BudgiePreTrainedModel):
                 hs,
                 use_cache=bool(use_cache),
                 past_key_value=past_key_values,
-                layer_idx=layer_idx,
+                layer_idx=virtual_layer_idx,
                 attention_mask_2d=attention_mask_2d,
             )
 
@@ -234,7 +235,7 @@ class BudgieModel(BudgiePreTrainedModel):
             position_embeddings=position_embeddings,
             landmark_mask=landmark_mask,
             attention_mask_2d=attention_mask_2d,
-            layer_idx=layer_idx,
+            layer_idx=virtual_layer_idx,
             attn_mode=self._layer_attn_mode[layer_idx],
         )
 
@@ -281,14 +282,6 @@ class BudgieModel(BudgiePreTrainedModel):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of `input_ids` or `inputs_embeds`.")
 
-        if self.num_phases > 1:
-            if use_cache or past_key_values is not None:
-                logger.warning_once(
-                    "`num_phases > 1` disables KV-cache. Forcing `use_cache=False` and dropping `past_key_values`."
-                )
-            use_cache = False
-            past_key_values = None
-
         if self.gradient_checkpointing and self.training and use_cache:
             logger.warning_once("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`.")
             use_cache = False
@@ -302,8 +295,25 @@ class BudgieModel(BudgiePreTrainedModel):
             landmark_mask = input_ids.eq(int(landmark_token_id))
 
         return_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, Cache) and not self.training:
-            return_legacy_cache = True
+        if self.num_phases > 1:
+            if isinstance(past_key_values, StaticCache):
+                raise ValueError("`StaticCache` is not supported when `num_phases > 1`. Use `DynamicCache` instead.")
+            if past_key_values is not None and not isinstance(past_key_values, Cache):
+                raise ValueError(
+                    "Legacy `past_key_values` (tuple/list) is not supported when `num_phases > 1`. "
+                    "Pass a `transformers.cache_utils.Cache` instance (e.g. `DynamicCache`)."
+                )
+            if use_cache:
+                logger.warning_once(
+                    "Multi-phase KV-cache enabled (`num_phases > 1`): cache memory scales with `num_phases`."
+                )
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache()
+
+        if past_key_values is not None and not isinstance(past_key_values, Cache) and not self.training:
+            # Back-compat for `num_phases==1`: accept legacy tuples/lists and convert to a Cache.
+            return_legacy_cache = bool(use_cache)
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             logger.warning_once(
                 "Detected `past_key_values` as a legacy tuple. Prefer passing a `transformers.cache_utils.Cache` instance."
@@ -326,20 +336,28 @@ class BudgieModel(BudgiePreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
+        num_layers = int(getattr(self.config, "num_hidden_layers", len(self.layers)))
+        if num_layers != len(self.layers):
+            raise RuntimeError(
+                f"Unexpected layer count mismatch: config.num_hidden_layers={num_layers}, len(self.layers)={len(self.layers)}."
+            )
+
         if bool(getattr(self.config, "share_all_layers", False)):
             for phase_idx in range(self.num_phases):
                 for layer_idx, scaffold in enumerate(self.layers):
+                    virtual_layer_idx = (phase_idx * num_layers) + layer_idx
                     if output_hidden_states:
                         all_hidden_states += (hidden_states,)
 
                     if self.gradient_checkpointing and self.training:
 
-                        def create_custom_forward(scaffold, phase_idx, layer_idx):
+                        def create_custom_forward(scaffold, phase_idx, layer_idx, virtual_layer_idx):
                             def custom_forward(*inputs):
                                 return self._shared_layer_forward(
                                     scaffold,
                                     phase_idx,
                                     layer_idx,
+                                    virtual_layer_idx,
                                     *inputs,
                                     landmark_mask=landmark_mask,
                                     attention_mask_2d=attention_mask,
@@ -348,7 +366,7 @@ class BudgieModel(BudgiePreTrainedModel):
                             return custom_forward
 
                         layer_outputs = self._gradient_checkpointing_func(
-                            create_custom_forward(scaffold, phase_idx, layer_idx),
+                            create_custom_forward(scaffold, phase_idx, layer_idx, virtual_layer_idx),
                             hidden_states,
                             causal_mask,
                             position_ids,
@@ -363,6 +381,7 @@ class BudgieModel(BudgiePreTrainedModel):
                             scaffold,
                             phase_idx,
                             layer_idx,
+                            virtual_layer_idx,
                             hidden_states,
                             causal_mask,
                             position_ids,
@@ -385,12 +404,13 @@ class BudgieModel(BudgiePreTrainedModel):
         else:
             for phase_idx in range(self.num_phases):
                 for layer_idx, decoder_layer in enumerate(self.layers):
+                    virtual_layer_idx = (phase_idx * num_layers) + layer_idx
                     if output_hidden_states:
                         all_hidden_states += (hidden_states,)
 
                     if self.gradient_checkpointing and self.training:
 
-                        def create_custom_forward(module, phase_idx, layer_idx):
+                        def create_custom_forward(module, phase_idx, layer_idx, virtual_layer_idx):
                             def custom_forward(*inputs):
                                 hs_in = inputs[0]
                                 attn_gate, mlp_gate = self._get_phase_layer_gates(
@@ -400,6 +420,7 @@ class BudgieModel(BudgiePreTrainedModel):
                                     *inputs,
                                     attn_gate=attn_gate,
                                     mlp_gate=mlp_gate,
+                                    layer_idx=virtual_layer_idx,
                                     landmark_mask=landmark_mask,
                                     attention_mask_2d=attention_mask,
                                 )
@@ -407,7 +428,7 @@ class BudgieModel(BudgiePreTrainedModel):
                             return custom_forward
 
                         layer_outputs = self._gradient_checkpointing_func(
-                            create_custom_forward(decoder_layer, phase_idx, layer_idx),
+                            create_custom_forward(decoder_layer, phase_idx, layer_idx, virtual_layer_idx),
                             hidden_states,
                             causal_mask,
                             position_ids,
@@ -432,6 +453,7 @@ class BudgieModel(BudgiePreTrainedModel):
                             position_embeddings=position_embeddings,
                             attn_gate=attn_gate,
                             mlp_gate=mlp_gate,
+                            layer_idx=virtual_layer_idx,
                             landmark_mask=landmark_mask,
                             attention_mask_2d=attention_mask,
                         )
@@ -483,7 +505,10 @@ class BudgieModel(BudgiePreTrainedModel):
                 # Bridge layers (e.g. landmark attention) need an explicit additive 4D mask.
                 pass
             else:
-                if AttentionMaskConverter._ignore_causal_mask_sdpa(
+                # When decoding with a KV-cache (`past_seen_tokens>0`), SDPA's `is_causal=True` path may not be
+                # sufficient across PyTorch versions when `q_len != k_len`. In that case, prefer an explicit
+                # additive causal mask that accounts for `cache_position`.
+                if past_seen_tokens == 0 and AttentionMaskConverter._ignore_causal_mask_sdpa(
                     attention_mask,
                     inputs_embeds=input_tensor,
                     past_key_values_length=past_seen_tokens,

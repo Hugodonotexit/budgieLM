@@ -10,6 +10,10 @@ Budgie is a small research codebase for a decoder-only language model that exper
 
 This repo is intended for experimentation and smoke-testing, not as a polished training framework.
 
+## Architecture
+
+![BudgieLM graph](asset/BudgieLMgraph.png)
+
 ## Layout
 
 - `budgie/budgie_config.py` – `BudgieConfig` (Transformers `PretrainedConfig`)
@@ -69,7 +73,9 @@ Two ways to define landmarks:
 ### Multi-phase stack reuse
 
 - `num_phases > 1` re-runs the full decoder stack multiple times.
-- KV-cache is disabled when `num_phases > 1` (Budgie forces `use_cache=False` and drops `past_key_values`).
+- KV-cache is supported when `num_phases > 1` using dynamic cache (`transformers.cache_utils.DynamicCache`).
+  - Cache memory scales roughly with `num_phases`.
+  - Static cache modes (e.g. `StaticCache`) are not supported for `num_phases > 1` yet.
 
 Optional conditioning:
 - `use_phase_layer_gates=True` enables per-(phase,layer) gates that scale attention and MLP residual updates.
