@@ -12,7 +12,7 @@ This repo is intended for experimentation and smoke-testing, not as a polished t
 
 ## Architecture
 
-![BudgieLM graph](asset/BudgieLMgraph.png)
+![BudgieLM graph](asset/BudgieLMgraph.png?v=2)
 
 ## Layout
 

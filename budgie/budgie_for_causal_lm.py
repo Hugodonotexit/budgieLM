@@ -126,22 +126,17 @@ class BudgieForCausalLM(BudgiePreTrainedModel, GenerationMixin):
                         )
 
                 if self._liger_fused_linear_ce_loss_fn is not None and not self._liger_fused_linear_ce_disabled:
-                    hs = hidden_states[:, :-1, :].contiguous()
-                    tgt = labels[:, 1:].contiguous()
+                    hs = hidden_states[:, :-1, :].contiguous().reshape(-1, hidden_states.shape[-1])
+                    tgt = labels[:, 1:].contiguous().reshape(-1)
                     w = self.lm_head.weight
                     loss_fn = self._liger_fused_linear_ce_loss_fn
                     try:  # pragma: no cover
+                        # Liger fused CE expects flattened hidden states + labels.
+                        # Preferred signature is (weight, hidden_states, target).
                         try:
-                            loss = loss_fn(hs, w, tgt)
-                        except TypeError:
                             loss = loss_fn(w, hs, tgt)
-                    except TypeError:  # pragma: no cover
-                        hs_f = hs.reshape(-1, hs.shape[-1])
-                        tgt_f = tgt.reshape(-1)
-                        try:
-                            loss = loss_fn(hs_f, w, tgt_f)
                         except TypeError:
-                            loss = loss_fn(w, hs_f, tgt_f)
+                            loss = loss_fn(hs, w, tgt)
                     except Exception as exc:
                         self._liger_fused_linear_ce_disabled = True
                         logger.warning_once(

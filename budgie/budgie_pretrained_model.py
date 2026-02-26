@@ -21,10 +21,17 @@ class BudgiePreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
+        elif isinstance(module, nn.Embedding) or (
+            hasattr(module, "weight")
+            and isinstance(module.weight, nn.Parameter)
+            and getattr(module.weight, "ndim", 0) == 2
+            and hasattr(module, "num_embeddings")
+            and hasattr(module, "embedding_dim")
+        ):
             module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+            padding_idx = getattr(module, "padding_idx", None)
+            if padding_idx is not None:
+                module.weight.data[int(padding_idx)].zero_()
 
 
 __all__ = ["BudgiePreTrainedModel"]
