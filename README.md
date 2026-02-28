@@ -1,119 +1,122 @@
-# Budgie
+# budgieLM1.0
 
-Budgie is a small research codebase for a decoder-only language model that experiments with:
+`budgieLM1.0` is a compact decoder-only language model focused on long-context research.
 
-- **GLA-style latent attention** (`gla_sliding`, `gla_landmark`) implemented on top of PyTorch **SDPA** (no Hopper-only FlashAttention requirement).
-- A **hybrid layer schedule**: sliding-window “local” layers + landmark “bridge” layers.
-- Optional **tiny causal depthwise conv** in selected layers.
-- Optional **multi-phase stack reuse** (`num_phases > 1`): run the whole decoder stack multiple times, feeding the last-layer output back into layer 0 (Universal-Transformer-style), with optional **per-(phase,layer) gates**.
-- Optional **ALBERT-style depth sharing** (`share_all_layers=True`): share one attention+MLP core across all layers (still compatible with hybrid algorithms).
-
-This repo is intended for experimentation and smoke-testing, not as a polished training framework.
+It combines local sliding-window attention with periodic landmark bridge layers, plus optional tiny convolution, stack reuse, and shared-depth variants.
 
 ## Architecture
 
-![BudgieLM graph](asset/BudgieLMgraph.png?v=2)
+![budgieLM graph](asset/BudgieLMgraph.png?v=2)
 
-## Layout
+## What is in 1.0
 
-- `budgie/budgie_config.py` – `BudgieConfig` (Transformers `PretrainedConfig`)
-- `budgie/budgie_model.py` – `BudgieModel`
-- `budgie/budgie_for_causal_lm.py` – `BudgieForCausalLM`
-- `budgie/modeling_budgie_GLA.py` – attention + conv implementations
+- Hybrid attention schedule with two layer types:
+  - local layers: `gla_sliding`
+  - bridge layers: `gla_landmark`
+- Optional tiny causal depthwise convolution.
+- Optional multi-phase stack reuse (`num_phases > 1`).
+- Optional ALBERT-style depth sharing (`share_all_layers=True`).
+- PyTorch SDPA-first implementation with fallbacks and optional acceleration (`xformers`, `flash-attn`, `liger-kernel`, `causal_conv1d`).
 
-## Install / Run
+## Repository layout
 
-This repo is intentionally minimal (no packaging). 
+- `budgie/budgie_config.py`: `BudgieConfig`
+- `budgie/budgie_model.py`: core decoder model
+- `budgie/budgie_for_causal_lm.py`: causal LM head
+- `budgie/modeling_budgie_GLA.py`: attention and conv implementations
 
-Dependencies:
-- Python 3.10+ recommended
+## Requirements
+
+- Python 3.10+
 - `torch`
 - `transformers`
-- Optional: `xformers` (may accelerate some attention shapes; sliding-window local attention is not guaranteed on older GPUs)
-- Optional: `flash attention` (may accelerate some attention shapes; sliding-window local attention is not guaranteed on older GPUs)
-- Optional: `causal_conv1d` (if you enable `use_causal_conv1d=True`)
 
-## Key config knobs
+Optional dependencies:
 
-### Attention implementations
+- `xformers`
+- `flash-attn`
+- `liger-kernel`
+- `causal-conv1d`
 
-- `config._attn_implementation="sdpa"`: base attention backend uses PyTorch SDPA where applicable.
-- `local_attn_implementation="gla_sliding"`: local layers use sliding-window attention (`sliding_window` required).
-- `bridge_attn_implementation="gla_landmark"`: bridge layers use landmark attention.
+## Quick start
+
+```bash
+cd ai/budgie
+python - <<'PY'
+import torch
+from budgie import BudgieConfig, BudgieForCausalLM
+
+cfg = BudgieConfig(
+    vocab_size=32768,
+    hidden_size=3072,
+    intermediate_size=12288,
+    num_hidden_layers=30,
+    num_attention_heads=32,
+    max_position_embeddings=65536,
+)
+
+model = BudgieForCausalLM(cfg).eval()
+input_ids = torch.randint(0, cfg.vocab_size, (1, 128))
+out = model(input_ids=input_ids)
+print(out.logits.shape)
+PY
+```
+
+## Core configuration knobs
+
+### Attention backends
+
+- `_attn_implementation="sdpa"`
+- `local_attn_implementation="gla_sliding"`
+- `bridge_attn_implementation="gla_landmark"`
 
 ### Hybrid layer schedule
 
 Enable with:
-- `use_hybrid_layers=True`
-- `bridge_every_n_layers` and `bridge_layer_offset`
 
-Bridge layers are at indices:
+- `use_hybrid_layers=True`
+- `bridge_every_n_layers`
+- `bridge_layer_offset`
+
+Bridge layer indices follow:
+
 `bridge_layer_offset + k * bridge_every_n_layers`
 
-### Sliding window
+### Sliding window and landmarks
 
-- `sliding_window`: int window size for local layers (canonical name; legacy `attention_window` is mapped to it on load).
+- `sliding_window`: window size for local layers.
+- `landmark_every`: positional landmarks (`N-1, 2N-1, ...`).
+- `landmark_token_id`: token-driven landmarks (`input_ids == landmark_token_id`).
 
-### Landmark attention
-
-Two ways to define landmarks:
-
-- **Positional**: `landmark_every=N` (landmarks assumed at `N-1, 2N-1, ...`)
-- **Token-id**: `landmark_token_id=<id>` (landmarks are `input_ids == landmark_token_id`)
-
-### Tiny conv
+### Tiny convolution
 
 - `use_tiny_conv=True`
-- `use_causal_conv1d=True` to use `causal_conv1d` when available
-- Under hybrid mode you can choose where conv is enabled:
-  - `tiny_conv_on_local_layers`
-  - `tiny_conv_on_bridge_layers`
-  - `tiny_conv_every_n_bridge_layers`, `tiny_conv_bridge_start`
+- `use_causal_conv1d=True` to use `causal_conv1d` when available.
+- `tiny_conv_on_local_layers` / `tiny_conv_on_bridge_layers` to control placement.
 
 ### Multi-phase stack reuse
 
-- `num_phases > 1` re-runs the full decoder stack multiple times.
-- KV-cache is supported when `num_phases > 1` using dynamic cache (`transformers.cache_utils.DynamicCache`).
-  - Cache memory scales roughly with `num_phases`.
-  - Static cache modes (e.g. `StaticCache`) are not supported for `num_phases > 1` yet.
+- `num_phases > 1` reruns the full decoder stack.
+- `use_phase_layer_gates=True` enables per-(phase, layer) residual gates.
+- KV-cache works with dynamic cache; memory scales with `num_phases`.
 
-Optional conditioning:
-- `use_phase_layer_gates=True` enables per-(phase,layer) gates that scale attention and MLP residual updates.
+### Depth sharing
 
-### ALBERT-style depth sharing (optional)
-
-- `share_all_layers=True` shares **one attention+MLP core** across all layers.
-- LayerNorms (and optional conv scaffolds) remain per-layer.
+- `share_all_layers=True` shares one attention+MLP core across all layers.
 
 ### GLA grouping
 
-- `gla_num_groups` controls how many **latent groups** are used inside Budgie’s `LlamaGLA` implementation.
-  - Default is `2` (historical behavior).
-  - Must divide `num_attention_heads`.
-  - In this implementation, increasing groups increases the compressed KV projection size (more parameters/compute).
+- `gla_num_groups` must divide `num_attention_heads`.
 
-### Liger kernels (optional)
+## GPU compatibility
 
-With `use_liger_kernel=True` and `liger_kernel` installed, Budgie will opportunistically use Liger kernels when
-available:
+- Designed to run without Hopper-only FlashAttention requirements.
+- SDPA and eager paths are supported.
+- On older GPUs, optional kernels may not always activate; implementation falls back to PyTorch paths.
 
-- `LigerRMSNorm` + `LigerSwiGLUMLP` (existing)
-- `experimental.LigerEmbedding` (when available)
-- `liger_rotary_pos_emb` (when available)
-- `LigerSoftmax` in eager attention paths (when available)
-- `LigerFusedLinearCrossEntropyLoss` for training loss (otherwise `LigerCrossEntropyLoss`, otherwise PyTorch CE)
+## Training note
 
-If a kernel can’t be imported or fails at runtime, Budgie falls back to the PyTorch implementation.
-
-Notes:
-- `LigerEmbedding` is experimental.
-- When fused linear+CE is used during training, logits are still returned but computed under `torch.no_grad()` to
-  reduce VRAM.
-
-## Notes for older GPUs (e.g., V100 / sm70)
-
-- Budgie uses SDPA/eager attention paths; Hopper-only FlashAttention is not required.
-- xFormers may still be useful for some dense attention shapes, but **sliding-window local attention via xFormers is not guaranteed** on all GPUs/dtypes/head dimensions. Budgie includes fallbacks.
+This repository is the model package. The training pipeline in this workspace lives outside this folder (for example `ai/train_pipe.py`).
 
 ## License
 

@@ -27,7 +27,7 @@ class BudgieConfig(PretrainedConfig):
         # ----------------------------
         # Context length / positions
         # ----------------------------
-        max_position_embeddings: int = 1024 * 32,
+        max_position_embeddings: int = 1024 * 64,
         # Alias for `max_position_embeddings` (often called "context length" in training code).
         context_length: int | None = None,
 
@@ -61,7 +61,7 @@ class BudgieConfig(PretrainedConfig):
         rope_scaling_factor: float | None = 1,
         rope_scaling_type: str = "yarn",
         # Optional hint for rope_scaling variants that want the original context length.
-        original_max_position_embeddings: int | None = 32*1024,
+        original_max_position_embeddings: int | None = 64*1024,
         attention_bias: bool = False,
         attention_dropout: float = 0.01,
         mlp_bias: bool = False,
