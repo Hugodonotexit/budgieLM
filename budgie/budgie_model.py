@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -22,12 +23,22 @@ from .modeling_budgie_GLA import (
     budgie_make_mlp,
     budgie_make_rmsnorm,
 )
+from .modeling_budgie_gsm import GSM
+from .modeling_budgie_latent_bottleneck import LatentBottleneckMacroBlock
+from .modeling_budgie_pkm import SWABlockWithPKM
 
 logger = logging.get_logger(__name__)
 
 
 class BudgieLayerScaffold(nn.Module):
-    def __init__(self, config: BudgieConfig, layer_idx: int, enable_tiny_conv: bool):
+    def __init__(
+        self,
+        config: BudgieConfig,
+        layer_idx: int,
+        enable_tiny_conv: bool,
+        enable_gsm: bool,
+        is_bridge_layer: bool,
+    ):
         super().__init__()
         self.layer_idx = layer_idx
         self.input_layernorm = budgie_make_rmsnorm(config, config.hidden_size, config.rms_norm_eps)
@@ -47,6 +58,104 @@ class BudgieLayerScaffold(nn.Module):
         else:
             self.tiny_conv = None
 
+        if enable_gsm:
+            self.gsm = GSM(
+                d_model=config.hidden_size,
+                max_seq_len=int(config.max_position_embeddings),
+                n_groups=int(getattr(config, "gsm_n_groups", 8)),
+                gate_rank=int(getattr(config, "gsm_gate_rank", 32)),
+                alpha=float(getattr(config, "gsm_alpha", 0.5)),
+                dropout=float(getattr(config, "gsm_dropout", 0.0)),
+                use_triton=bool(getattr(config, "gsm_use_triton", True)),
+                w_init_scale=float(getattr(config, "gsm_w_init_scale", 0.02)),
+                rms_eps=float(getattr(config, "gsm_rms_eps", 1e-6)),
+            )
+        else:
+            self.gsm = None
+
+        self.bridge_mixer_fusion = bool(is_bridge_layer and self.gsm is not None)
+        if self.bridge_mixer_fusion:
+            self.bridge_alpha_proj = nn.Linear(config.hidden_size, 1, bias=True)
+            self.bridge_out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+            nn.init.zeros_(self.bridge_alpha_proj.weight)
+            nn.init.zeros_(self.bridge_alpha_proj.bias)
+            nn.init.eye_(self.bridge_out_proj.weight)
+        else:
+            self.bridge_alpha_proj = None
+            self.bridge_out_proj = None
+
+
+class BudgiePerceiverMacroLayer(nn.Module):
+    """
+    Wrapper that adapts a Perceiver-style macro-block to the decoder-layer call signature.
+    """
+
+    def __init__(self, config: BudgieConfig, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+
+        self.seed_latents = nn.Parameter(
+            torch.randn(int(getattr(config, "perceiver_num_latents", 128)), config.hidden_size)
+            / math.sqrt(float(config.hidden_size))
+        )
+        self.block = LatentBottleneckMacroBlock(
+            config=config,
+            heads_tokens=int(getattr(config, "perceiver_heads_tokens", config.num_attention_heads)),
+            heads_latents=int(getattr(config, "perceiver_heads_latents", config.num_attention_heads)),
+            mlp_mult=float(getattr(config, "perceiver_mlp_mult", 4.0)),
+            dropout=float(getattr(config, "perceiver_dropout", 0.0)),
+            droppath=float(getattr(config, "perceiver_droppath", 0.0)),
+            latent_process_layers=int(getattr(config, "perceiver_latent_process_layers", 1)),
+            use_fft_in_latents=bool(getattr(config, "perceiver_use_fft_in_latents", False)),
+            gate_writeback=bool(getattr(config, "perceiver_gate_writeback", True)),
+            layer_idx=layer_idx,
+        )
+        self.read_is_causal = bool(getattr(config, "perceiver_read_is_causal", True))
+        self.write_is_causal = bool(getattr(config, "perceiver_write_is_causal", True))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attn_gate: Optional[torch.Tensor] = None,
+        mlp_gate: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        token_mask_2d = kwargs.get("attention_mask_2d", None)
+        if token_mask_2d is None and attention_mask is not None and attention_mask.dim() == 2:
+            token_mask_2d = attention_mask
+
+        del attention_mask, position_ids, cache_position, position_embeddings, kwargs
+        residual = hidden_states
+        bsz = hidden_states.shape[0]
+        latents = self.seed_latents.unsqueeze(0).expand(bsz, -1, -1).contiguous()
+        out, _ = self.block(
+            hidden_states,
+            latents,
+            read_is_causal=self.read_is_causal,
+            write_is_causal=self.write_is_causal,
+            attn_mask_read=token_mask_2d,
+        )
+        delta = out - residual
+        if attn_gate is None:
+            attn_gate = 1
+        if mlp_gate is None:
+            mlp_gate = 1
+        hidden_states = residual + (delta * attn_gate * mlp_gate)
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (None,)
+        if use_cache:
+            outputs += (past_key_value,)
+        return outputs
+
 
 class BudgieModel(BudgiePreTrainedModel):
     def __init__(self, config: BudgieConfig):
@@ -59,6 +168,7 @@ class BudgieModel(BudgiePreTrainedModel):
         self.embed_tokens = budgie_make_embedding(config, config.vocab_size, config.hidden_size, self.padding_idx)
         share_all_layers = bool(getattr(config, "share_all_layers", False))
         use_hybrid_layers = bool(getattr(config, "use_hybrid_layers", False))
+        use_macro_structure = bool(getattr(config, "use_macro_structure", True))
 
         local_impl = str(getattr(config, "local_attn_implementation", "gla_sliding"))
         bridge_impl = str(getattr(config, "bridge_attn_implementation", "gla_landmark"))
@@ -69,6 +179,24 @@ class BudgieModel(BudgiePreTrainedModel):
         tiny_conv_on_bridge = bool(getattr(config, "tiny_conv_on_bridge_layers", True))
         tiny_conv_every_n_bridge = int(getattr(config, "tiny_conv_every_n_bridge_layers", 2))
         tiny_conv_bridge_start = int(getattr(config, "tiny_conv_bridge_start", 2))
+        use_gsm = bool(getattr(config, "use_gsm", False))
+        gsm_on_local = bool(getattr(config, "gsm_on_local_layers", False))
+        gsm_on_bridge = bool(getattr(config, "gsm_on_bridge_layers", True))
+        gsm_every_n_bridge = int(getattr(config, "gsm_every_n_bridge_layers", 1))
+        gsm_bridge_start = int(getattr(config, "gsm_bridge_start", 1))
+
+        macro_pattern_raw = str(getattr(config, "macro_structure_pattern", "swa,perceiver,swa_dilated,bridge,swa"))
+        macro_pattern = [p.strip().lower() for p in macro_pattern_raw.split(",") if p.strip()]
+        if use_macro_structure:
+            if not macro_pattern:
+                raise ValueError("`macro_structure_pattern` must contain at least one layer token when enabled.")
+            valid_tokens = {"swa", "perceiver", "swa_dilated", "bridge"}
+            invalid = [p for p in macro_pattern if p not in valid_tokens]
+            if invalid:
+                raise ValueError(
+                    "`macro_structure_pattern` contains invalid tokens. "
+                    f"Allowed tokens: {sorted(valid_tokens)}. Got invalid={invalid!r}."
+                )
 
         def is_bridge(layer_idx: int) -> bool:
             return use_hybrid_layers and layer_idx >= bridge_offset and (layer_idx - bridge_offset) % bridge_every == 0
@@ -77,6 +205,29 @@ class BudgieModel(BudgiePreTrainedModel):
             return ((layer_idx - bridge_offset) // bridge_every) + 1
 
         self._layer_is_bridge: list[bool] = [is_bridge(i) for i in range(config.num_hidden_layers)]
+        self._layer_type: list[str] | None = None
+
+        def _layer_tiny_conv(bridge: bool, bridge_idx: int) -> bool:
+            if not bool(getattr(config, "use_tiny_conv", False)):
+                return False
+            if not bridge:
+                return tiny_conv_on_local
+            return (
+                tiny_conv_on_bridge
+                and bridge_idx >= tiny_conv_bridge_start
+                and (bridge_idx - tiny_conv_bridge_start) % tiny_conv_every_n_bridge == 0
+            )
+
+        def _layer_gsm(bridge: bool, bridge_idx: int) -> bool:
+            if not use_gsm:
+                return False
+            if not bridge:
+                return gsm_on_local
+            return (
+                gsm_on_bridge
+                and bridge_idx >= gsm_bridge_start
+                and (bridge_idx - gsm_bridge_start) % gsm_every_n_bridge == 0
+            )
 
         if self.use_phase_layer_gates:
             if self.num_phases <= 0:
@@ -96,10 +247,76 @@ class BudgieModel(BudgiePreTrainedModel):
             self.mlp_gate_proj = None
 
         if not share_all_layers:
-            if not use_hybrid_layers:
+            if use_macro_structure:
+                self._layer_type = [macro_pattern[i % len(macro_pattern)] for i in range(config.num_hidden_layers)]
+                self._layer_is_bridge = [kind == "bridge" for kind in self._layer_type]
+                self._needs_4d_causal_mask = any(self._layer_is_bridge)
+                layers: list[nn.Module] = []
+                bridge_seen = 0
+                for layer_idx, kind in enumerate(self._layer_type):
+                    if kind == "perceiver":
+                        layers.append(BudgiePerceiverMacroLayer(config, layer_idx=layer_idx))
+                        continue
+
+                    bridge = kind == "bridge"
+                    if bridge:
+                        bridge_seen += 1
+                        bridge_idx = bridge_seen
+                    else:
+                        bridge_idx = 0
+
+                    if kind == "swa":
+                        attn_impl = "gla_sliding"
+                    elif kind == "swa_dilated":
+                        attn_impl = "gla_sliding_dilated"
+                    elif kind == "bridge":
+                        attn_impl = bridge_impl
+                    else:
+                        raise RuntimeError(f"Unexpected layer type token: {kind!r}.")
+
+                    # Use PKM-augmented SWA block for non-dilated SWA layers if enabled
+                    if (
+                        kind == "swa"
+                        and bool(getattr(config, "use_pkm", False))
+                        and bool(getattr(config, "pkm_on_non_dilated_swa", True))
+                    ):
+                        layers.append(
+                            SWABlockWithPKM(
+                                config,
+                                layer_idx,
+                                attn_implementation=attn_impl,
+                                num_product_keys=int(getattr(config, "pkm_num_product_keys", 8)),
+                                product_key_size=int(getattr(config, "pkm_product_key_size", 32)),
+                                value_size=int(getattr(config, "pkm_value_size", 128)),
+                                enable_tiny_conv=_layer_tiny_conv(bridge=bridge, bridge_idx=bridge_idx),
+                                enable_gsm=_layer_gsm(bridge=bridge, bridge_idx=bridge_idx),
+                                is_bridge_layer=bridge,
+                            )
+                        )
+                    else:
+                        layers.append(
+                            LlamaDecoderLayer(
+                                config,
+                                layer_idx,
+                                attn_implementation=attn_impl,
+                                enable_tiny_conv=_layer_tiny_conv(bridge=bridge, bridge_idx=bridge_idx),
+                                enable_gsm=_layer_gsm(bridge=bridge, bridge_idx=bridge_idx),
+                                is_bridge_layer=bridge,
+                            )
+                        )
+                self.layers = nn.ModuleList(layers)
+            elif not use_hybrid_layers:
                 self._needs_4d_causal_mask = False
                 self.layers = nn.ModuleList(
-                    [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+                    [
+                        LlamaDecoderLayer(
+                            config,
+                            layer_idx,
+                            enable_gsm=(use_gsm and gsm_on_local),
+                            is_bridge_layer=False,
+                        )
+                        for layer_idx in range(config.num_hidden_layers)
+                    ]
                 )
             else:
                 self._needs_4d_causal_mask = any(self._layer_is_bridge)
@@ -107,29 +324,23 @@ class BudgieModel(BudgiePreTrainedModel):
                 for layer_idx in range(config.num_hidden_layers):
                     bridge = self._layer_is_bridge[layer_idx]
                     attn_impl = bridge_impl if bridge else local_impl
-
-                    if not bool(getattr(config, "use_tiny_conv", False)):
-                        enable_tiny_conv = False
-                    elif not bridge:
-                        enable_tiny_conv = tiny_conv_on_local
-                    else:
-                        bn = bridge_number(layer_idx)
-                        enable_tiny_conv = (
-                            tiny_conv_on_bridge
-                            and bn >= tiny_conv_bridge_start
-                            and (bn - tiny_conv_bridge_start) % tiny_conv_every_n_bridge == 0
-                        )
+                    bn = bridge_number(layer_idx) if bridge else 0
 
                     layers.append(
                         LlamaDecoderLayer(
                             config,
                             layer_idx,
                             attn_implementation=attn_impl,
-                            enable_tiny_conv=enable_tiny_conv,
+                            enable_tiny_conv=_layer_tiny_conv(bridge=bridge, bridge_idx=bn),
+                            enable_gsm=_layer_gsm(bridge=bridge, bridge_idx=bn),
+                            is_bridge_layer=bridge,
                         )
                     )
                 self.layers = nn.ModuleList(layers)
         else:
+            if use_macro_structure:
+                raise ValueError("`use_macro_structure=True` is not supported with `share_all_layers=True` yet.")
+
             def impl_to_mode(impl: str) -> str:
                 if impl == "gla_sliding":
                     return "sliding"
@@ -153,18 +364,16 @@ class BudgieModel(BudgiePreTrainedModel):
             scaffolds: list[nn.Module] = []
             for layer_idx in range(config.num_hidden_layers):
                 bridge = self._layer_is_bridge[layer_idx]
-                if not bool(getattr(config, "use_tiny_conv", False)):
-                    enable_tiny_conv = False
-                elif not bridge:
-                    enable_tiny_conv = tiny_conv_on_local
-                else:
-                    bn = bridge_number(layer_idx)
-                    enable_tiny_conv = (
-                        tiny_conv_on_bridge
-                        and bn >= tiny_conv_bridge_start
-                        and (bn - tiny_conv_bridge_start) % tiny_conv_every_n_bridge == 0
+                bn = bridge_number(layer_idx) if bridge else 0
+                scaffolds.append(
+                    BudgieLayerScaffold(
+                        config,
+                        layer_idx=layer_idx,
+                        enable_tiny_conv=_layer_tiny_conv(bridge=bridge, bridge_idx=bn),
+                        enable_gsm=_layer_gsm(bridge=bridge, bridge_idx=bn),
+                        is_bridge_layer=bridge,
                     )
-                scaffolds.append(BudgieLayerScaffold(config, layer_idx=layer_idx, enable_tiny_conv=enable_tiny_conv))
+                )
 
             self.layers = nn.ModuleList(scaffolds)
         self.norm = budgie_make_rmsnorm(config, config.hidden_size, config.rms_norm_eps)
@@ -212,20 +421,31 @@ class BudgieModel(BudgiePreTrainedModel):
     ):
         residual = hidden_states
         hs = scaffold.input_layernorm(hidden_states)
+        if scaffold.bridge_mixer_fusion and self._layer_attn_mode[layer_idx] == "landmark":
+            z = hs
+            if scaffold.tiny_conv is not None:
+                z = scaffold.tiny_conv(
+                    z,
+                    use_cache=bool(use_cache),
+                    past_key_value=past_key_values,
+                    layer_idx=virtual_layer_idx,
+                    attention_mask_2d=attention_mask_2d,
+                )
+        else:
+            if scaffold.tiny_conv is not None:
+                hs = hs + scaffold.tiny_conv(
+                    hs,
+                    use_cache=bool(use_cache),
+                    past_key_value=past_key_values,
+                    layer_idx=virtual_layer_idx,
+                    attention_mask_2d=attention_mask_2d,
+                )
+            z = hs
 
-        if scaffold.tiny_conv is not None:
-            hs = hs + scaffold.tiny_conv(
-                hs,
-                use_cache=bool(use_cache),
-                past_key_value=past_key_values,
-                layer_idx=virtual_layer_idx,
-                attention_mask_2d=attention_mask_2d,
-            )
-
-        attn_gate, mlp_gate = self._get_phase_layer_gates(phase_idx=phase_idx, layer_idx=layer_idx, hidden_states=hs)
+        attn_gate, mlp_gate = self._get_phase_layer_gates(phase_idx=phase_idx, layer_idx=layer_idx, hidden_states=z)
 
         attn_out, attn_weights, present = self.shared_attn(
-            hidden_states=hs,
+            hidden_states=z,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_values,
@@ -238,6 +458,14 @@ class BudgieModel(BudgiePreTrainedModel):
             layer_idx=virtual_layer_idx,
             attn_mode=self._layer_attn_mode[layer_idx],
         )
+
+        if scaffold.bridge_mixer_fusion and self._layer_attn_mode[layer_idx] == "landmark":
+            gsm_out = scaffold.gsm(z)
+            alpha = torch.sigmoid(scaffold.bridge_alpha_proj(z.mean(dim=1))).view(z.shape[0], 1, 1)
+            mixed = (alpha * attn_out) + ((1.0 - alpha) * gsm_out)
+            attn_out = scaffold.bridge_out_proj(mixed)
+        elif scaffold.gsm is not None:
+            attn_out = attn_out + scaffold.gsm(z)
 
         hidden_states = residual + (attn_out * attn_gate)
         residual = hidden_states

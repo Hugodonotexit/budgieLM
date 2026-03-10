@@ -32,6 +32,8 @@ from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.utils import logging
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+from .modeling_budgie_gsm import GSM
+
 logger = logging.get_logger(__name__)
 
 
@@ -717,6 +719,7 @@ def _budgie_xformers_attention(
     dropout_p: float,
     is_causal: bool,
     sliding_window: Optional[int] = None,
+    sliding_dilation: int = 1,
     allow_xformers_op: bool = True,
     use_liger_kernel: bool = False,
 ) -> torch.Tensor:
@@ -728,9 +731,10 @@ def _budgie_xformers_attention(
     k_len = k.shape[1]
     qk_dim = q.shape[-1]
 
-    if sliding_window is not None and isinstance(sliding_window, int) and sliding_window >= k_len:
-        # If the window covers all available keys, local attention is identical to dense causal attention.
-        sliding_window = None
+    if sliding_window is not None and isinstance(sliding_window, int) and sliding_window <= 0:
+        raise ValueError("`sliding_window` must be a positive int when provided.")
+    if not isinstance(sliding_dilation, int) or sliding_dilation <= 0:
+        raise ValueError(f"`sliding_dilation` must be a positive int, got {sliding_dilation!r}.")
 
     # Many xFormers CUDA kernels have strict requirements (dtype, head dim multiple-of-8, etc.).
     # If we can confidently predict that dispatch will fail, skip straight to the eager fallback
@@ -740,6 +744,9 @@ def _budgie_xformers_attention(
         if q.dtype not in (torch.float16, torch.bfloat16):
             try_xformers_op = False
         if qk_dim < 32 or (qk_dim % 8) != 0:
+            try_xformers_op = False
+        if sliding_dilation != 1:
+            # xFormers masks do not provide a direct dilation pattern API for this local-causal layout.
             try_xformers_op = False
         if sliding_window is not None:
             try:
@@ -789,6 +796,9 @@ def _budgie_xformers_attention(
             if not isinstance(sliding_window, int) or sliding_window <= 0:
                 raise ValueError("xFormers sliding-window attention requires `sliding_window` to be a positive int.")
             allowed = allowed & (j >= (i + offset - (sliding_window - 1)))
+            if sliding_dilation != 1:
+                dist = (i + offset) - j
+                allowed = allowed & ((dist % sliding_dilation) == 0)
 
         bias = bias.masked_fill(~allowed, min_val)
         attn_bias = bias[None, None, :, :]  # (1, 1, S_q, S_k)
@@ -870,6 +880,12 @@ def _budgie_xformers_attention(
                 allowed = (k_abs[None, :] <= q_abs[:, None]) & (k_abs[None, :] >= (q_abs[:, None] - (w - 1)))
             else:
                 allowed = k_abs[None, :] >= (q_abs[:, None] - (w - 1))
+            if sliding_dilation != 1:
+                dist = q_abs[:, None] - k_abs[None, :]
+                if is_causal:
+                    allowed = allowed & ((dist % sliding_dilation) == 0)
+                else:
+                    allowed = allowed & ((dist.abs() % sliding_dilation) == 0)
 
             attn_scores = torch.matmul(q_chunk, k_range.transpose(-2, -1)) * scale
             attn_scores = attn_scores.masked_fill(~allowed[None, None, :, :], min_val)
@@ -1496,6 +1512,7 @@ class BudgieGLASlidingWindowAttention(LlamaGLA):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.sliding_window = getattr(self.config, "sliding_window", None)
+        self.sliding_dilation = 1
 
         if not isinstance(self.sliding_window, int) or self.sliding_window <= 0:
             raise ValueError(
@@ -1521,6 +1538,7 @@ class BudgieGLASlidingWindowAttention(LlamaGLA):
                 dropout_p=dropout_p,
                 is_causal=bool(self.is_causal),
                 sliding_window=int(self.sliding_window),
+                sliding_dilation=int(self.sliding_dilation),
                 allow_xformers_op=bool(getattr(self.config, "use_xformers", False)),
                 use_liger_kernel=bool(getattr(self.config, "use_liger_kernel", False)),
             )
@@ -1559,6 +1577,55 @@ class BudgieGLASlidingWindowAttention(LlamaGLA):
                     ) from exc
 
         return attn_output
+
+
+class BudgieGLADilatedSlidingWindowAttention(LlamaGLA):
+    """
+    GLA attention with a causal sliding window and dilation.
+
+    Configure with:
+    - `config.swa_dilation` as a positive int.
+    - `config.swa_dilated_window` or `config.sliding_window` as a positive int.
+    - `config._attn_implementation = "gla_sliding_dilated"`.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sliding_window = getattr(self.config, "swa_dilated_window", None)
+        if self.sliding_window is None:
+            self.sliding_window = getattr(self.config, "sliding_window", None)
+        self.sliding_dilation = int(getattr(self.config, "swa_dilation", 2))
+        if not isinstance(self.sliding_window, int) or self.sliding_window <= 0:
+            raise ValueError(
+                "BudgieGLADilatedSlidingWindowAttention requires `config.swa_dilated_window` (or `config.sliding_window`) to be a positive int."
+            )
+        if self.sliding_dilation <= 0:
+            raise ValueError(
+                f"BudgieGLADilatedSlidingWindowAttention requires `config.swa_dilation` > 0, got {self.sliding_dilation!r}."
+            )
+
+    def _flash_attn(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        landmark_mask: Optional[torch.Tensor] = None,
+        attention_mask_2d: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        dropout_p = float(self.attention_dropout) if self.training else 0.0
+        return _budgie_xformers_attention(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            attention_mask_2d=attention_mask_2d,
+            dropout_p=dropout_p,
+            is_causal=bool(self.is_causal),
+            sliding_window=int(self.sliding_window),
+            sliding_dilation=int(self.sliding_dilation),
+            allow_xformers_op=bool(getattr(self.config, "use_xformers", False)),
+            use_liger_kernel=bool(getattr(self.config, "use_liger_kernel", False)),
+        )
 
 
 class BudgieGLALandmarkAttention(LlamaGLA):
@@ -1812,6 +1879,7 @@ LLAMA_ATTENTION_CLASSES = {
     "eager": LlamaAttention,
     "sdpa": LlamaGLA,
     "gla_sliding": BudgieGLASlidingWindowAttention,
+    "gla_sliding_dilated": BudgieGLADilatedSlidingWindowAttention,
     "gla_landmark": BudgieGLALandmarkAttention,
 }
 
@@ -1823,6 +1891,8 @@ class LlamaDecoderLayer(nn.Module):
         layer_idx: int,
         attn_implementation: Optional[str] = None,
         enable_tiny_conv: Optional[bool] = None,
+        enable_gsm: Optional[bool] = None,
+        is_bridge_layer: bool = False,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1852,6 +1922,35 @@ class LlamaDecoderLayer(nn.Module):
             )
         else:
             self.tiny_conv = None
+
+        if enable_gsm is None:
+            enable_gsm = bool(getattr(config, "use_gsm", False))
+
+        if enable_gsm:
+            self.gsm = GSM(
+                d_model=config.hidden_size,
+                max_seq_len=int(getattr(config, "max_position_embeddings", 0)),
+                n_groups=int(getattr(config, "gsm_n_groups", 8)),
+                gate_rank=int(getattr(config, "gsm_gate_rank", 32)),
+                alpha=float(getattr(config, "gsm_alpha", 0.5)),
+                dropout=float(getattr(config, "gsm_dropout", 0.0)),
+                use_triton=bool(getattr(config, "gsm_use_triton", True)),
+                w_init_scale=float(getattr(config, "gsm_w_init_scale", 0.02)),
+                rms_eps=float(getattr(config, "gsm_rms_eps", 1e-6)),
+            )
+        else:
+            self.gsm = None
+
+        self.bridge_mixer_fusion = bool(is_bridge_layer and self.gsm is not None and impl == "gla_landmark")
+        if self.bridge_mixer_fusion:
+            self.bridge_alpha_proj = nn.Linear(config.hidden_size, 1, bias=True)
+            self.bridge_out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+            nn.init.zeros_(self.bridge_alpha_proj.weight)
+            nn.init.zeros_(self.bridge_alpha_proj.bias)
+            nn.init.eye_(self.bridge_out_proj.weight)
+        else:
+            self.bridge_alpha_proj = None
+            self.bridge_out_proj = None
 
     def forward(
         self,
@@ -1891,31 +1990,48 @@ class LlamaDecoderLayer(nn.Module):
         """
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
-
-        if self.tiny_conv is not None:
-            hidden_states = hidden_states + self.tiny_conv(
-                hidden_states,
-                use_cache=bool(use_cache),
-                past_key_value=past_key_value,
-                layer_idx=kwargs.get("layer_idx", self.layer_idx),
-                attention_mask_2d=kwargs.get("attention_mask_2d"),
-            )
+        hs = self.input_layernorm(hidden_states)
+        if self.bridge_mixer_fusion:
+            z = hs
+            if self.tiny_conv is not None:
+                z = self.tiny_conv(
+                    z,
+                    use_cache=bool(use_cache),
+                    past_key_value=past_key_value,
+                    layer_idx=kwargs.get("layer_idx", self.layer_idx),
+                    attention_mask_2d=kwargs.get("attention_mask_2d"),
+                )
+        else:
+            if self.tiny_conv is not None:
+                hs = hs + self.tiny_conv(
+                    hs,
+                    use_cache=bool(use_cache),
+                    past_key_value=past_key_value,
+                    layer_idx=kwargs.get("layer_idx", self.layer_idx),
+                    attention_mask_2d=kwargs.get("attention_mask_2d"),
+                )
+            z = hs
 
         # Self Attention
-
-
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
+            hidden_states=z,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+
+        if self.bridge_mixer_fusion:
+            y_gsm = self.gsm(z)
+            alpha = torch.sigmoid(self.bridge_alpha_proj(z.mean(dim=1))).view(z.shape[0], 1, 1)
+            y = (alpha * hidden_states) + ((1.0 - alpha) * y_gsm)
+            hidden_states = self.bridge_out_proj(y)
+        elif self.gsm is not None:
+            hidden_states = hidden_states + self.gsm(z)
 
 
         if attn_gate is None:
